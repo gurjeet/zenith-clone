@@ -883,7 +883,7 @@ impl Connection {
             self.stream.set_nonblocking(false).unwrap();
 
             match read_result {
-                Ok(0) => break,
+                Ok(0) => {},
                 Ok(_) => {
                     if let Some(FeMessage::CopyData(m)) = self.parse_message()? {
                         self.timeline()
