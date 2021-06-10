@@ -77,6 +77,19 @@ pub fn init_repo(conf: &'static PageServerConf, repo_dir: &Path) -> Result<()> {
     }
     println!("initdb succeeded");
 
+    let pg_resetwal_path = conf.pg_bin_dir().join("pg_resetwal");
+    let pg_resetwal_output =  Command::new(pg_resetwal_path)
+    .args(&["-D", tmppath.to_str().unwrap()])
+    .args(&["-x", "2000027648"])
+    .stdout(Stdio::null())
+    .output()
+    .with_context(|| "failed to execute pg-resetwal")?;
+
+    if !pg_resetwal_output.status.success() {
+        anyhow::bail!("pg_resetwal failed");
+    }
+    println!("pg_resetwal succeeded");
+
     // Read control file to extract the LSN and system id
     let controlfile_path = tmppath.join("global").join("pg_control");
     let controlfile = ControlFileData::decode(&fs::read(controlfile_path)?)?;
@@ -110,10 +123,10 @@ pub fn init_repo(conf: &'static PageServerConf, repo_dir: &Path) -> Result<()> {
 
     // Move the initial WAL file
     fs::rename(
-        tmppath.join("pg_wal").join("000000010000000000000001"),
+        tmppath.join("pg_wal").join("000000010000000000000002"),
         timelinedir
             .join("wal")
-            .join("000000010000000000000001.partial"),
+            .join("000000010000000000000002.partial"),
     )?;
     println!("created initial timeline {}", tli);
 
