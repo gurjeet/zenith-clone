@@ -21,21 +21,16 @@
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use lazy_static::lazy_static;
+use futures::{FutureExt, TryFutureExt};
 use log::*;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
 use std::io::Error;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 use zenith_metrics::{register_histogram, register_int_counter, Histogram, IntCounter};
 use zenith_utils::bin_ser::BeSer;
@@ -198,15 +193,15 @@ impl WalRedoManager for PostgresRedoManager {
 
             // launch the WAL redo process on first use
             if process_guard.is_none() {
-                let p = self
-                    .runtime
-                    .block_on(PostgresRedoProcess::launch(self.conf, &self.tenantid))?;
-                *process_guard = Some(p);
+                process_guard.replace(
+                    self.runtime
+                        .block_on(PostgresRedoProcess::launch(self.conf, &self.tenantid))?,
+                );
             }
-            let process = (*process_guard).as_ref().unwrap();
+            let mut process = process_guard.as_mut().unwrap();
 
             self.runtime
-                .block_on(self.handle_apply_request(&process, &request))
+                .block_on(self.handle_apply_request(&mut process, &request))
         };
         end_time = Instant::now();
 
@@ -246,14 +241,14 @@ impl PostgresRedoManager {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .expect("failed to initialize tokio runtime");
 
         // The actual process is launched lazily, on first request.
         PostgresRedoManager {
             runtime,
             tenantid,
             conf,
-            process: Mutex::new(None),
+            process: Default::default(),
         }
     }
 
@@ -262,36 +257,31 @@ impl PostgresRedoManager {
     ///
     async fn handle_apply_request(
         &self,
-        process: &PostgresRedoProcess,
+        process: &mut PostgresRedoProcess,
         request: &WalRedoRequest,
     ) -> Result<Bytes, WalRedoError> {
         let rel = request.rel;
         let blknum = request.blknum;
-        let lsn = request.lsn;
-        let base_img = request.base_img.clone();
+        let base_img = &request.base_img;
         let records = &request.records;
-
         let nrecords = records.len();
 
         let start = Instant::now();
 
-        let apply_result: Result<Bytes, Error>;
-        if let RelishTag::Relation(rel) = rel {
+        let result = if let RelishTag::Relation(rel) = rel {
             // Relational WAL records are applied using wal-redo-postgres
             let buf_tag = BufferTag { rel, blknum };
-            apply_result = process.apply_wal_records(buf_tag, base_img, records).await;
+            process
+                .apply_wal_records(buf_tag, base_img.as_deref(), records)
+                .await
         } else {
             // Non-relational WAL records are handled here, with custom code that has the
             // same effects as the corresponding Postgres WAL redo function.
-            const ZERO_PAGE: [u8; 8192] = [0u8; 8192];
-            let mut page = BytesMut::new();
-            if let Some(fpi) = base_img {
-                // If full-page image is provided, then use it...
-                page.extend_from_slice(&fpi[..]);
-            } else {
-                // otherwise initialize page with zeros
-                page.extend_from_slice(&ZERO_PAGE);
-            }
+            const ZERO_PAGE: &[u8] = &[0u8; 8192];
+
+            // Use full-page image if it's provided, otherwise initialize with zeros
+            let mut page = BytesMut::from(base_img.as_deref().unwrap_or(ZERO_PAGE));
+
             // Apply all collected WAL records
             for record in records {
                 let mut buf = record.rec.clone();
@@ -302,7 +292,7 @@ impl PostgresRedoManager {
                 // FIXME: refactor to avoid code duplication.
                 let xlogrec = XLogRecord::from_bytes(&mut buf);
 
-                //move to main data
+                // move to main data
                 // TODO probably, we should store some records in our special format
                 // to avoid this weird parsing on replay
                 let skip = (record.main_data_offset - pg_constants::SIZEOF_XLOGRECORD) as usize;
@@ -310,16 +300,11 @@ impl PostgresRedoManager {
                     buf.advance(skip);
                 }
 
+                // Transaction manager stuff
                 if xlogrec.xl_rmid == pg_constants::RM_XACT_ID {
-                    // Transaction manager stuff
                     let rec_segno = match rel {
-                        RelishTag::Slru { slru, segno } => {
-                            if slru != SlruKind::Clog {
-                                panic!("Not valid XACT relish tag {:?}", rel);
-                            }
-                            segno
-                        }
-                        _ => panic!("Not valid XACT relish tag {:?}", rel),
+                        RelishTag::Slru { slru: SlruKind::Clog, segno } => segno,
+                        _ => panic!("Invalid XACT relish tag {:?}", rel),
                     };
                     let parsed_xact =
                         XlXactParsedRecord::decode(&mut buf, xlogrec.xl_xid, xlogrec.xl_info);
@@ -366,95 +351,89 @@ impl PostgresRedoManager {
                             }
                         }
                     }
-                } else if xlogrec.xl_rmid == pg_constants::RM_MULTIXACT_ID {
-                    // Multixact operations
+                }
+                // Multixact operations
+                else if xlogrec.xl_rmid == pg_constants::RM_MULTIXACT_ID {
                     let info = xlogrec.xl_info & pg_constants::XLR_RMGR_INFO_MASK;
-                    if info == pg_constants::XLOG_MULTIXACT_CREATE_ID {
-                        let xlrec = XlMultiXactCreate::decode(&mut buf);
-                        if let RelishTag::Slru {
-                            slru,
-                            segno: rec_segno,
-                        } = rel
-                        {
-                            if slru == SlruKind::MultiXactMembers {
-                                for i in 0..xlrec.nmembers {
-                                    let pageno =
-                                        i / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
-                                    let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
-                                    let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
-                                    if segno == rec_segno && rpageno == blknum {
-                                        // update only target block
-                                        let offset = xlrec.moff + i;
-                                        let memberoff = mx_offset_to_member_offset(offset);
-                                        let flagsoff = mx_offset_to_flags_offset(offset);
-                                        let bshift = mx_offset_to_flags_bitshift(offset);
-                                        let mut flagsval =
-                                            LittleEndian::read_u32(&page[flagsoff..flagsoff + 4]);
-                                        flagsval &= !(((1
-                                            << pg_constants::MXACT_MEMBER_BITS_PER_XACT)
-                                            - 1)
-                                            << bshift);
-                                        flagsval |= xlrec.members[i as usize].status << bshift;
-                                        LittleEndian::write_u32(
-                                            &mut page[flagsoff..flagsoff + 4],
-                                            flagsval,
-                                        );
-                                        LittleEndian::write_u32(
-                                            &mut page[memberoff..memberoff + 4],
-                                            xlrec.members[i as usize].xid,
-                                        );
-                                    }
-                                }
-                            } else {
-                                // Multixact offsets SLRU
-                                let offs = (xlrec.mid
-                                    % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32
-                                    * 4) as usize;
-                                LittleEndian::write_u32(&mut page[offs..offs + 4], xlrec.moff);
+                    if info != pg_constants::XLOG_MULTIXACT_CREATE_ID {
+                        panic!();
+                    }
+
+                    let (slru, rec_segno) = match rel {
+                        RelishTag::Slru { slru, segno } => (slru, segno),
+                        _ => panic!(),
+                    };
+
+                    let xlrec = XlMultiXactCreate::decode(&mut buf);
+
+                    if slru == SlruKind::MultiXactMembers {
+                        for i in 0..xlrec.nmembers {
+                            let pageno = i / pg_constants::MULTIXACT_MEMBERS_PER_PAGE as u32;
+                            let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
+                            let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
+                            if segno == rec_segno && rpageno == blknum {
+                                // update only target block
+                                let offset = xlrec.moff + i;
+                                let memberoff = mx_offset_to_member_offset(offset);
+                                let flagsoff = mx_offset_to_flags_offset(offset);
+                                let bshift = mx_offset_to_flags_bitshift(offset);
+                                let mut flagsval =
+                                    LittleEndian::read_u32(&page[flagsoff..flagsoff + 4]);
+                                flagsval &= !(((1 << pg_constants::MXACT_MEMBER_BITS_PER_XACT)
+                                    - 1)
+                                    << bshift);
+                                flagsval |= xlrec.members[i as usize].status << bshift;
+                                LittleEndian::write_u32(
+                                    &mut page[flagsoff..flagsoff + 4],
+                                    flagsval,
+                                );
+                                LittleEndian::write_u32(
+                                    &mut page[memberoff..memberoff + 4],
+                                    xlrec.members[i as usize].xid,
+                                );
                             }
-                        } else {
-                            panic!();
                         }
                     } else {
-                        panic!();
+                        // Multixact offsets SLRU
+                        let offs = (xlrec.mid % pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32 * 4)
+                            as usize;
+                        LittleEndian::write_u32(&mut page[offs..offs + 4], xlrec.moff);
                     }
                 }
             }
 
-            apply_result = Ok::<Bytes, Error>(page.freeze());
-        }
+            Ok::<Bytes, Error>(page.freeze())
+        };
 
         let duration = start.elapsed();
-
-        let result: Result<Bytes, WalRedoError>;
-
         debug!(
             "applied {} WAL records in {} ms to reconstruct page image at LSN {}",
             nrecords,
             duration.as_millis(),
-            lsn
+            request.lsn
         );
 
-        if let Err(e) = apply_result {
-            error!("could not apply WAL records: {}", e);
-            result = Err(WalRedoError::IoError(e));
-        } else {
-            let img = apply_result.unwrap();
-
-            result = Ok(img);
-        }
-
         // The caller is responsible for sending the response
-        result
+        result.map_err(|e| {
+            error!("could not apply WAL records: {}", e);
+            WalRedoError::IoError(e)
+        })
     }
 }
 
 ///
 /// Handle to the Postgres WAL redo process
 ///
-struct PostgresRedoProcess {
-    stdin: RefCell<ChildStdin>,
-    stdout: RefCell<ChildStdout>,
+struct PostgresRedoProcess(Child);
+
+impl PostgresRedoProcess {
+    fn streams(&mut self) -> (&mut ChildStdin, &mut ChildStdout) {
+        (
+            // NB: stderr is already taken care of
+            self.0.stdin.as_mut().unwrap(),
+            self.0.stdout.as_mut().unwrap(),
+        )
+    }
 }
 
 impl PostgresRedoProcess {
@@ -470,23 +449,21 @@ impl PostgresRedoProcess {
         // one WAL redo manager concurrently.
         let datadir = conf.tenant_path(&tenantid).join("wal-redo-datadir");
 
-        // Create empty data directory for wal-redo postgres, deleting old one first.
-        if datadir.exists() {
-            info!("directory {:?} exists, removing", &datadir);
-            if let Err(e) = fs::remove_dir_all(&datadir) {
-                error!("could not remove old wal-redo-datadir: {:?}", e);
-            }
-        }
+        // Delete old data directory if it exists.
+        // We can ignore possible errors, because initdb will
+        // complain if it finds any conflicting files.
+        let _ = tokio::fs::remove_dir_all(&datadir);
+
+        // Create empty data directory for wal-redo postgres
         info!("running initdb in {:?}", datadir.display());
         let initdb = Command::new(conf.pg_bin_dir().join("initdb"))
             .args(&["-D", datadir.to_str().unwrap()])
             .arg("-N")
             .env_clear()
-            .env("LD_LIBRARY_PATH", conf.pg_lib_dir().to_str().unwrap())
-            .env("DYLD_LIBRARY_PATH", conf.pg_lib_dir().to_str().unwrap())
+            .env("LD_LIBRARY_PATH", conf.pg_bin_dir().as_os_str())
+            .env("DYLD_LIBRARY_PATH", conf.pg_bin_dir().as_os_str())
             .output()
-            .await
-            .expect("failed to execute initdb");
+            .await?;
 
         if !initdb.status.success() {
             panic!(
@@ -494,16 +471,26 @@ impl PostgresRedoProcess {
                 std::str::from_utf8(&initdb.stdout).unwrap(),
                 std::str::from_utf8(&initdb.stderr).unwrap()
             );
-        } else {
-            // Limit shared cache for wal-redo-postres
-            let mut config = OpenOptions::new()
-                .append(true)
-                .open(PathBuf::from(&datadir).join("postgresql.conf"))?;
-            config.write_all(b"shared_buffers=128kB\n")?;
-            config.write_all(b"fsync=off\n")?;
-            config.write_all(b"shared_preload_libraries=zenith\n")?;
-            config.write_all(b"zenith.wal_redo=on\n")?;
         }
+
+        let mut config = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(PathBuf::from(&datadir).join("postgresql.conf"))
+            .await?;
+
+        // Limit shared cache for wal-redo-postres
+        config
+            .write_all(
+                concat![
+                    "shared_buffers=128kB\n",
+                    "fsync=off\n",
+                    "shared_preload_libraries=zenith\n",
+                    "zenith.wal_redo=on\n",
+                ]
+                .as_bytes(),
+            )
+            .await?;
+
         // Start postgres itself
         let mut child = Command::new(conf.pg_bin_dir().join("postgres"))
             .arg("--wal-redo")
@@ -511,46 +498,43 @@ impl PostgresRedoProcess {
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .env_clear()
-            .env("LD_LIBRARY_PATH", conf.pg_lib_dir().to_str().unwrap())
-            .env("DYLD_LIBRARY_PATH", conf.pg_lib_dir().to_str().unwrap())
+            .env("LD_LIBRARY_PATH", conf.pg_lib_dir().as_os_str())
+            .env("DYLD_LIBRARY_PATH", conf.pg_lib_dir().as_os_str())
             .env("PGDATA", &datadir)
-            .spawn()
-            .expect("postgres --wal-redo command failed to start");
+            .spawn()?;
 
         info!(
             "launched WAL redo postgres process on {:?}",
             datadir.display()
         );
 
-        let stdin = child.stdin.take().expect("failed to open child's stdin");
         let stderr = child.stderr.take().expect("failed to open child's stderr");
-        let stdout = child.stdout.take().expect("failed to open child's stdout");
 
         // This async block reads the child's stderr, and forwards it to the logger
-        let f_stderr = async {
+        tokio::spawn(async {
             let mut stderr_buffered = tokio::io::BufReader::new(stderr);
 
             let mut line = String::new();
             loop {
-                let res = stderr_buffered.read_line(&mut line).await;
-                if res.is_err() {
-                    debug!("could not convert line to utf-8");
-                    continue;
+                match stderr_buffered.read_line(&mut line).await {
+                    Ok(0) => {
+                        // Zero means that nobody can write to the pipe
+                        error!("apparently, wal-redo-postgres has exited");
+                        break;
+                    }
+                    Ok(_) => {
+                        error!("wal-redo-postgres: {}", line.trim());
+                        line.clear();
+                    }
+                    Err(e) => {
+                        error!("failed to read stderr of wal-redo-postgres: {}", e);
+                        continue;
+                    }
                 }
-                if res.unwrap() == 0 {
-                    break;
-                }
-                error!("wal-redo-postgres: {}", line.trim());
-                line.clear();
             }
-            Ok::<(), Error>(())
-        };
-        tokio::spawn(f_stderr);
+        });
 
-        Ok(PostgresRedoProcess {
-            stdin: RefCell::new(stdin),
-            stdout: RefCell::new(stdout),
-        })
+        Ok(PostgresRedoProcess(child))
     }
 
     //
@@ -558,13 +542,12 @@ impl PostgresRedoProcess {
     // new page image.
     //
     async fn apply_wal_records(
-        &self,
+        &mut self,
         tag: BufferTag,
-        base_img: Option<Bytes>,
+        base_img: Option<&[u8]>,
         records: &[WALRecord],
     ) -> Result<Bytes, std::io::Error> {
-        let mut stdin = self.stdin.borrow_mut();
-        let mut stdout = self.stdout.borrow_mut();
+        let (stdin, stdout) = self.streams();
 
         // We do three things simultaneously: send the old base image and WAL records to
         // the child process's stdin, read the result from child's stdout, and forward any logging
@@ -573,59 +556,51 @@ impl PostgresRedoProcess {
         // 'f_stdin' handles writing the base image and WAL records to the child process.
         // 'f_stdout' below reads the result back. And 'f_stderr', which was spawned into the
         // tokio runtime in the 'launch' function already, forwards the logging.
-        let f_stdin = async {
+        let f_stdin = timeout(TIMEOUT, async {
+            let mut buf = BytesMut::default();
+
+            write_begin_redo_for_block_msg(&mut buf, tag);
+
             // Send base image, if any. (If the record initializes the page, previous page
             // version is not needed.)
-            timeout(
-                TIMEOUT,
-                stdin.write_all(&build_begin_redo_for_block_msg(tag)),
-            )
-            .await??;
-            if base_img.is_some() {
-                timeout(
-                    TIMEOUT,
-                    stdin.write_all(&build_push_page_msg(tag, base_img.unwrap())),
-                )
-                .await??;
+            if let Some(img) = base_img {
+                write_push_page_msg(&mut buf, tag, img);
             }
 
             // Send WAL records.
-            for rec in records.iter() {
-                let r = rec.clone();
-
+            for record in records {
                 WAL_REDO_RECORD_COUNTER.inc();
-
-                stdin
-                    .write_all(&build_apply_record_msg(r.lsn, r.rec))
-                    .await?;
-
-                //debug!("sent WAL record to wal redo postgres process ({:X}/{:X}",
-                //       r.lsn >> 32, r.lsn & 0xffff_ffff);
+                write_apply_record_msg(&mut buf, record.lsn, &record.rec);
             }
-            //debug!("sent {} WAL records to wal redo postgres process ({:X}/{:X}",
-            //       records.len(), lsn >> 32, lsn & 0xffff_ffff);
 
             // Send GetPage command to get the result back
-            timeout(TIMEOUT, stdin.write_all(&build_get_page_msg(tag))).await??;
-            timeout(TIMEOUT, stdin.flush()).await??;
-            //debug!("sent GetPage for {}", tag.blknum);
-            Ok::<(), Error>(())
-        };
+            write_get_page_msg(&mut buf, tag);
+
+            stdin.write_all(&buf).await?;
+            stdin.flush().await?;
+
+            Ok(())
+        })
+        .map_err(|e| Error::from(e)) // Elapsed -> io::Error
+        .map(|x| x.and_then(|y| y)); // x.flatten()
 
         // Read back new page image
-        let f_stdout = async {
-            let mut buf = [0u8; 8192];
+        let f_stdout = timeout(TIMEOUT, async {
+            let mut buf = vec![0u8; 8192];
 
-            timeout(TIMEOUT, stdout.read_exact(&mut buf)).await??;
-            //debug!("got response for {}", tag.blknum);
-            Ok::<[u8; 8192], Error>(buf)
-        };
+            stdout.read_exact(&mut buf).await.map_err(|e| {
+                error!("failed to read a page from postgres-wal-redo: {}", e);
+                e
+            })?;
 
-        let res = tokio::try_join!(f_stdout, f_stdin)?;
+            Ok(buf)
+        })
+        .map_err(|e| Error::from(e)) // Elapsed -> io::Error
+        .map(|x| x.and_then(|y| y)); // x.flatten()
 
-        let buf = res.0;
+        let (buf, ()) = tokio::try_join!(f_stdout, f_stdin)?;
 
-        Ok::<Bytes, Error>(Bytes::from(std::vec::Vec::from(buf)))
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -633,81 +608,74 @@ impl PostgresRedoProcess {
 // process. See vendor/postgres/src/backend/tcop/zenith_wal_redo.c for
 // explanation of the protocol.
 
-fn build_begin_redo_for_block_msg(tag: BufferTag) -> Bytes {
-    let len = 4 + 1 + 4 * 4;
-    let mut buf = BytesMut::with_capacity(1 + len);
-
-    buf.put_u8(b'B');
-    buf.put_u32(len as u32);
-
-    // FIXME: this is a temporary hack that should go away when we refactor
-    // the postgres protocol serialization + handlers.
-    //
-    // BytesMut is a dynamic growable buffer, used a lot in tokio code but
-    // not in the std library. To write to a BytesMut from a serde serializer,
-    // we need to either:
-    // - pre-allocate the required buffer space. This is annoying because we
-    //   shouldn't care what the exact serialized size is-- that's the
-    //   serializer's job.
-    // - Or, we need to create a temporary "writer" (which implements the
-    //   `Write` trait). It's a bit awkward, because the writer consumes the
-    //   underlying BytesMut, and we need to extract it later with
-    //   `into_inner`.
-    let mut writer = buf.writer();
-    tag.ser_into(&mut writer)
-        .expect("serialize BufferTag should always succeed");
-    let buf = writer.into_inner();
-
-    debug_assert!(buf.len() == 1 + len);
-
-    buf.freeze()
+#[inline(always)]
+fn assert_increased_by_n(buf: &mut BytesMut, n: usize, f: impl FnOnce(&mut BytesMut)) {
+    let before = buf.len();
+    f(buf);
+    let after = buf.len();
+    debug_assert!(after - before == n);
 }
 
-fn build_push_page_msg(tag: BufferTag, base_img: Bytes) -> Bytes {
+fn write_begin_redo_for_block_msg(buf: &mut BytesMut, tag: BufferTag) {
+    let len = 4 + 1 + 4 * 4;
+
+    assert_increased_by_n(buf, 1 + len, |buf| {
+        buf.put_u8(b'B');
+        buf.put_u32(len as u32);
+
+        // FIXME: this is a temporary hack that should go away when we refactor
+        // the postgres protocol serialization + handlers.
+        //
+        // BytesMut is a dynamic growable buffer, used a lot in tokio code but
+        // not in the std library. To write to a BytesMut from a serde serializer,
+        // we need to either:
+        // - pre-allocate the required buffer space. This is annoying because we
+        //   shouldn't care what the exact serialized size is-- that's the
+        //   serializer's job.
+        // - Or, we need to create a temporary "writer" (which implements the
+        //   `Write` trait). It's a bit awkward, because the writer consumes the
+        //   underlying BytesMut, and we need to extract it later with
+        //   `into_inner`.
+        let mut writer = buf.writer();
+        tag.ser_into(&mut writer)
+            .expect("serialize BufferTag should always succeed");
+    });
+}
+
+fn write_push_page_msg(buf: &mut BytesMut, tag: BufferTag, base_img: &[u8]) {
     assert!(base_img.len() == 8192);
 
     let len = 4 + 1 + 4 * 4 + base_img.len();
-    let mut buf = BytesMut::with_capacity(1 + len);
 
-    buf.put_u8(b'P');
-    buf.put_u32(len as u32);
-    let mut writer = buf.writer();
-    tag.ser_into(&mut writer)
-        .expect("serialize BufferTag should always succeed");
-    let mut buf = writer.into_inner();
-    buf.put(base_img);
-
-    debug_assert!(buf.len() == 1 + len);
-
-    buf.freeze()
+    assert_increased_by_n(buf, 1 + len, |buf| {
+        buf.put_u8(b'P');
+        buf.put_u32(len as u32);
+        let mut writer = buf.writer();
+        tag.ser_into(&mut writer)
+            .expect("serialize BufferTag should always succeed");
+        buf.put(base_img);
+    });
 }
 
-fn build_apply_record_msg(endlsn: Lsn, rec: Bytes) -> Bytes {
+fn write_apply_record_msg(buf: &mut BytesMut, endlsn: Lsn, rec: &[u8]) {
     let len = 4 + 8 + rec.len();
-    let mut buf = BytesMut::with_capacity(1 + len);
 
-    buf.put_u8(b'A');
-    buf.put_u32(len as u32);
-    buf.put_u64(endlsn.0);
-    buf.put(rec);
-
-    debug_assert!(buf.len() == 1 + len);
-
-    buf.freeze()
+    assert_increased_by_n(buf, 1 + len, |buf| {
+        buf.put_u8(b'A');
+        buf.put_u32(len as u32);
+        buf.put_u64(endlsn.0);
+        buf.put(rec);
+    });
 }
 
-fn build_get_page_msg(tag: BufferTag) -> Bytes {
+fn write_get_page_msg(buf: &mut BytesMut, tag: BufferTag) {
     let len = 4 + 1 + 4 * 4;
-    let mut buf = BytesMut::with_capacity(1 + len);
 
-    buf.put_u8(b'G');
-    buf.put_u32(len as u32);
-    let mut writer = buf.writer();
-    tag.ser_into(&mut writer)
-        .expect("serialize BufferTag should always succeed");
-    let buf = writer.into_inner();
-
-    debug_assert!(buf.len() == 1 + len);
-
-    buf.freeze()
+    assert_increased_by_n(buf, 1 + len, |buf| {
+        buf.put_u8(b'G');
+        buf.put_u32(len as u32);
+        let mut writer = buf.writer();
+        tag.ser_into(&mut writer)
+            .expect("serialize BufferTag should always succeed");
+    });
 }
