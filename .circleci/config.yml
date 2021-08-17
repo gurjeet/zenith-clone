@@ -7,7 +7,7 @@ executors:
   zenith-build-executor:
     resource_class: xlarge
     docker:
-      - image: cimg/rust:1.51.0
+      - image: cimg/rust:1.54.0
 
 jobs:
 
@@ -100,7 +100,7 @@ jobs:
       - run:
           name: Rust build << parameters.build_type >>
           command: |
-            export CARGO_INCREMENTAL=0
+            export CARGO_INCREMENTAL=1
             BUILD_TYPE="<< parameters.build_type >>"
             if [[ $BUILD_TYPE == "debug" ]]; then
               echo "Build in debug mode"
@@ -128,7 +128,7 @@ jobs:
       - run:
           name: cargo install
           command: |
-            export CARGO_INCREMENTAL=0
+            export CARGO_INCREMENTAL=1
             BUILD_TYPE="<< parameters.build_type >>"
             if [[ $BUILD_TYPE == "debug" ]]; then
               echo "Install debug mode"
