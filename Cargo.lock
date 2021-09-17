@@ -2569,6 +2569,7 @@ dependencies = [
  "jsonwebtoken",
  "lazy_static",
  "log",
+ "once_cell",
  "postgres",
  "rand",
  "routerify",

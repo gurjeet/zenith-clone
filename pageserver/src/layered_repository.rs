@@ -44,6 +44,7 @@ use zenith_metrics::{register_histogram_vec, HistogramVec};
 use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use zenith_utils::seqwait::SeqWait;
+use zenith_utils::cache::CacheStringRepr;
 
 mod blob;
 mod delta_layer;
@@ -131,7 +132,7 @@ impl Repository for LayeredRepository {
             ancestor_timeline: None,
             ancestor_lsn: Lsn(0),
         };
-        Self::save_metadata(self.conf, timelineid, self.tenantid, &metadata)?;
+        Self::save_metadata(self.conf, &timelineid, &self.tenantid, &metadata)?;
 
         let timeline = LayeredTimeline::new(
             self.conf,
@@ -175,7 +176,7 @@ impl Repository for LayeredRepository {
             ancestor_lsn: start_lsn,
         };
         std::fs::create_dir_all(self.conf.timeline_path(&dst, &self.tenantid))?;
-        Self::save_metadata(self.conf, dst, self.tenantid, &metadata)?;
+        Self::save_metadata(self.conf, &dst, &self.tenantid, &metadata)?;
 
         info!("branched timeline {} from {} at {}", dst, src, start_lsn);
 
@@ -211,7 +212,7 @@ impl LayeredRepository {
         match timelines.get(&timelineid) {
             Some(timeline) => Ok(timeline.clone()),
             None => {
-                let metadata = Self::load_metadata(self.conf, timelineid, self.tenantid)?;
+                let metadata = Self::load_metadata(self.conf, &timelineid, &self.tenantid)?;
 
                 // Recurse to look up the ancestor timeline.
                 //
@@ -346,11 +347,11 @@ impl LayeredRepository {
     /// Save timeline metadata to file
     fn save_metadata(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         data: &TimelineMetadata,
     ) -> Result<()> {
-        let path = conf.timeline_path(&timelineid, &tenantid).join("metadata");
+        let path = conf.timeline_path(timelineid, tenantid).join("metadata");
         let mut file = File::create(&path)?;
 
         info!("saving metadata {}", path.display());
@@ -362,10 +363,10 @@ impl LayeredRepository {
 
     fn load_metadata(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
     ) -> Result<TimelineMetadata> {
-        let path = conf.timeline_path(&timelineid, &tenantid).join("metadata");
+        let path = conf.timeline_path(timelineid, tenantid).join("metadata");
         let data = std::fs::read(&path)?;
 
         let data = TimelineMetadata::des(&data)?;
@@ -435,7 +436,7 @@ impl LayeredRepository {
                     // FIXME: we open the timeline in the loop below with
                     // get_timeline_locked() anyway, so maybe we should just do it
                     // here, too.
-                    let metadata = Self::load_metadata(self.conf, timelineid, self.tenantid)?;
+                    let metadata = Self::load_metadata(self.conf, &timelineid, &self.tenantid)?;
                     if let Some(ancestor_timeline) = metadata.ancestor_timeline {
                         all_branchpoints.insert((ancestor_timeline, metadata.ancestor_lsn));
                     }
@@ -528,8 +529,8 @@ pub struct TimelineMetadata {
 pub struct LayeredTimeline {
     conf: &'static PageServerConf,
 
-    tenantid: ZTenantId,
-    timelineid: ZTimelineId,
+    tenantid: CacheStringRepr<ZTenantId>,
+    timelineid: CacheStringRepr<ZTimelineId>,
 
     layers: Mutex<LayerMap>,
 
@@ -954,8 +955,8 @@ impl LayeredTimeline {
     ) -> Result<LayeredTimeline> {
         let timeline = LayeredTimeline {
             conf,
-            timelineid,
-            tenantid,
+            timelineid: timelineid.into(),
+            tenantid: tenantid.into(),
             layers: Mutex::new(LayerMap::default()),
 
             walredo_mgr,
@@ -984,11 +985,11 @@ impl LayeredTimeline {
         );
         let mut layers = self.layers.lock().unwrap();
         let (imgfilenames, mut deltafilenames) =
-            filename::list_files(self.conf, self.timelineid, self.tenantid)?;
+            filename::list_files(self.conf, &self.timelineid, &self.tenantid)?;
 
         // First create ImageLayer structs for each image file.
         for filename in imgfilenames.iter() {
-            let layer = ImageLayer::new(self.conf, self.timelineid, self.tenantid, filename);
+            let layer = ImageLayer::new(self.conf, &self.timelineid, &self.tenantid, filename);
 
             info!(
                 "found layer {} {} on timeline {}",
@@ -1015,8 +1016,8 @@ impl LayeredTimeline {
 
             let layer = DeltaLayer::new(
                 self.conf,
-                self.timelineid,
-                self.tenantid,
+                &self.timelineid,
+                &self.tenantid,
                 filename,
                 predecessor,
             );
@@ -1177,7 +1178,7 @@ impl LayeredTimeline {
         if let Some((prev_layer, _prev_lsn)) = self.get_layer_for_read_locked(seg, lsn, &layers)? {
             // Create new entry after the previous one.
             let start_lsn;
-            if prev_layer.get_timeline_id() != self.timelineid {
+            if prev_layer.get_timeline_id() != *self.timelineid {
                 // First modification on this timeline
                 start_lsn = self.ancestor_lsn;
                 trace!(
@@ -1204,8 +1205,8 @@ impl LayeredTimeline {
             layer = InMemoryLayer::create_successor_layer(
                 self.conf,
                 prev_layer,
-                self.timelineid,
-                self.tenantid,
+                &self.timelineid,
+                &self.tenantid,
                 start_lsn,
                 lsn,
             )?;
@@ -1219,7 +1220,7 @@ impl LayeredTimeline {
             );
 
             layer =
-                InMemoryLayer::create(self.conf, self.timelineid, self.tenantid, seg, lsn, lsn)?;
+                InMemoryLayer::create(self.conf, &self.timelineid, &self.tenantid, seg, lsn, lsn)?;
         }
 
         let layer_rc: Arc<InMemoryLayer> = Arc::new(layer);
@@ -1361,7 +1362,7 @@ impl LayeredTimeline {
             }
         };
 
-        let ancestor_timelineid = self.ancestor_timeline.as_ref().map(|x| x.timelineid);
+        let ancestor_timelineid = self.ancestor_timeline.as_ref().map(|x| *x.timelineid);
 
         let metadata = TimelineMetadata {
             disk_consistent_lsn,
@@ -1369,7 +1370,7 @@ impl LayeredTimeline {
             ancestor_timeline: ancestor_timelineid,
             ancestor_lsn: self.ancestor_lsn,
         };
-        LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
+        LayeredRepository::save_metadata(self.conf, &self.timelineid, &self.tenantid, &metadata)?;
 
         // Also update the in-memory copy
         self.disk_consistent_lsn.store(disk_consistent_lsn);
@@ -1641,7 +1642,7 @@ impl LayeredTimeline {
             val + diff as usize,
         );
         LOGICAL_TIMELINE_SIZE
-            .with_label_values(&[&self.tenantid.to_string(), &self.timelineid.to_string()])
+            .with_label_values(&[self.tenantid.as_str(), self.timelineid.as_str()])
             .set(val as i64 + diff as i64)
     }
 

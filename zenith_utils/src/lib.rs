@@ -31,3 +31,6 @@ pub mod sock_split;
 
 // common log initialisation routine
 pub mod logging;
+
+// various cacheable types
+pub mod cache;

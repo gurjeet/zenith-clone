@@ -313,8 +313,8 @@ impl InMemoryLayer {
     ///
     pub fn create(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         seg: SegmentTag,
         start_lsn: Lsn,
         oldest_pending_lsn: Lsn,
@@ -328,8 +328,8 @@ impl InMemoryLayer {
 
         Ok(InMemoryLayer {
             conf,
-            timelineid,
-            tenantid,
+            timelineid: timelineid.clone(),
+            tenantid: tenantid.clone(),
             seg,
             start_lsn,
             end_lsn: None,
@@ -494,8 +494,8 @@ impl InMemoryLayer {
     pub fn create_successor_layer(
         conf: &'static PageServerConf,
         src: Arc<dyn Layer>,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         start_lsn: Lsn,
         oldest_pending_lsn: Lsn,
     ) -> Result<InMemoryLayer> {
@@ -517,8 +517,8 @@ impl InMemoryLayer {
 
         Ok(InMemoryLayer {
             conf,
-            timelineid,
-            tenantid,
+            timelineid: timelineid.clone(),
+            tenantid: tenantid.clone(),
             seg,
             start_lsn,
             end_lsn: None,
@@ -615,8 +615,8 @@ impl InMemoryLayer {
             let mut new_open = Self::create_successor_layer(
                 self.conf,
                 frozen.clone(),
-                self.timelineid,
-                self.tenantid,
+                &self.timelineid,
+                &self.tenantid,
                 end_lsn,
                 end_lsn,
             )?;

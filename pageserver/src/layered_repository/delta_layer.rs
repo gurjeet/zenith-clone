@@ -495,15 +495,15 @@ impl DeltaLayer {
     /// Create a DeltaLayer struct representing an existing file on disk.
     pub fn new(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         filename: &DeltaFileName,
         predecessor: Option<Arc<dyn Layer>>,
     ) -> DeltaLayer {
         DeltaLayer {
             path_or_conf: PathOrConf::Conf(conf),
-            timelineid,
-            tenantid,
+            timelineid: timelineid.clone(),
+            tenantid: tenantid.clone(),
             seg: filename.seg,
             start_lsn: filename.start_lsn,
             end_lsn: filename.end_lsn,

@@ -243,8 +243,8 @@ impl ImageLayer {
     /// Create a new image file, using the given array of pages.
     fn create(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         seg: SegmentTag,
         lsn: Lsn,
         base_images: Vec<Bytes>,
@@ -259,8 +259,8 @@ impl ImageLayer {
 
         let layer = ImageLayer {
             path_or_conf: PathOrConf::Conf(conf),
-            timelineid,
-            tenantid,
+            timelineid: timelineid.clone(),
+            tenantid: tenantid.clone(),
             seg,
             lsn,
             inner: Mutex::new(ImageLayerInner {
@@ -312,7 +312,6 @@ impl ImageLayer {
         lsn: Lsn,
     ) -> Result<ImageLayer> {
         let seg = src.get_seg_tag();
-        let timelineid = timeline.timelineid;
 
         let startblk;
         let size;
@@ -327,7 +326,7 @@ impl ImageLayer {
         trace!(
             "creating new ImageLayer for {} on timeline {} at {}",
             seg,
-            timelineid,
+            timeline.tenantid,
             lsn,
         );
 
@@ -338,7 +337,14 @@ impl ImageLayer {
             base_images.push(img);
         }
 
-        Self::create(conf, timelineid, timeline.tenantid, seg, lsn, base_images)
+        Self::create(
+            conf,
+            &timeline.timelineid,
+            &timeline.tenantid,
+            seg,
+            lsn,
+            base_images,
+        )
     }
 
     ///
@@ -395,14 +401,14 @@ impl ImageLayer {
     /// Create an ImageLayer struct representing an existing file on disk
     pub fn new(
         conf: &'static PageServerConf,
-        timelineid: ZTimelineId,
-        tenantid: ZTenantId,
+        timelineid: &ZTimelineId,
+        tenantid: &ZTenantId,
         filename: &ImageFileName,
     ) -> ImageLayer {
         ImageLayer {
             path_or_conf: PathOrConf::Conf(conf),
-            timelineid,
-            tenantid,
+            timelineid: timelineid.clone(),
+            tenantid: tenantid.clone(),
             seg: filename.seg,
             lsn: filename.lsn,
             inner: Mutex::new(ImageLayerInner {

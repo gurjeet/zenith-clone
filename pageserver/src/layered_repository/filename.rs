@@ -275,10 +275,10 @@ impl fmt::Display for ImageFileName {
 /// TODO: returning an Iterator would be more idiomatic
 pub fn list_files(
     conf: &'static PageServerConf,
-    timelineid: ZTimelineId,
-    tenantid: ZTenantId,
+    timelineid: &ZTimelineId,
+    tenantid: &ZTenantId,
 ) -> Result<(Vec<ImageFileName>, Vec<DeltaFileName>)> {
-    let path = conf.timeline_path(&timelineid, &tenantid);
+    let path = conf.timeline_path(timelineid, tenantid);
 
     let mut deltafiles: Vec<DeltaFileName> = Vec::new();
     let mut imgfiles: Vec<ImageFileName> = Vec::new();
