@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use crate::layered_repository::inmemory_layer::FreezeLayers;
-use crate::relish_storage::storage_uploader::{LayerUpload, RelishStorageWithBackgroundSync};
+use crate::relish::*;
+use crate::relish_storage::synced_storage::LayerUpload;
 use crate::repository::{GcResult, Repository, Timeline, WALRecord};
 use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
@@ -110,7 +111,6 @@ pub struct LayeredRepository {
     timelines: Mutex<HashMap<ZTimelineId, Arc<LayeredTimeline>>>,
 
     walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
-    relish_storage: Option<Arc<RelishStorageWithBackgroundSync>>,
 }
 
 /// Public interface
@@ -142,7 +142,6 @@ impl Repository for LayeredRepository {
             timelineid,
             self.tenantid,
             Arc::clone(&self.walredo_mgr),
-            self.relish_storage.as_ref().map(Arc::clone),
             0,
         )?;
 
@@ -234,7 +233,6 @@ impl LayeredRepository {
                     timelineid,
                     self.tenantid,
                     Arc::clone(&self.walredo_mgr),
-                    self.relish_storage.as_ref().map(Arc::clone),
                     0, // init with 0 and update after layers are loaded
                 )?;
 
@@ -274,16 +272,6 @@ impl LayeredRepository {
             conf,
             timelines: Mutex::new(HashMap::new()),
             walredo_mgr,
-            // TODO kb revert
-            relish_storage: Some(Arc::new(
-                RelishStorageWithBackgroundSync::new(
-                    &crate::RelishStorageConfig::LocalFs(PathBuf::from(
-                        "/Users/someonetoignore/Downloads/tmp_dir/",
-                    )),
-                    &conf.workdir,
-                )
-                .unwrap(),
-            )),
         }
     }
 
@@ -552,8 +540,6 @@ pub struct LayeredTimeline {
 
     // WAL redo manager
     walredo_mgr: Arc<dyn WalRedoManager + Sync + Send>,
-
-    relish_storage: Option<Arc<RelishStorageWithBackgroundSync>>,
 
     // What page versions do we hold in the repository? If we get a
     // request > last_record_lsn, we need to wait until we receive all
@@ -982,7 +968,6 @@ impl LayeredTimeline {
         timelineid: ZTimelineId,
         tenantid: ZTenantId,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
-        relish_storage: Option<Arc<RelishStorageWithBackgroundSync>>,
         current_logical_size: usize,
     ) -> Result<LayeredTimeline> {
         let current_logical_size_gauge = LOGICAL_TIMELINE_SIZE
@@ -995,7 +980,6 @@ impl LayeredTimeline {
             layers: Mutex::new(LayerMap::default()),
 
             walredo_mgr,
-            relish_storage,
 
             // initialize in-memory 'last_record_lsn' from 'disk_consistent_lsn'.
             last_record_lsn: SeqWait::new(RecordLsn {
@@ -1439,14 +1423,14 @@ impl LayeredTimeline {
         };
         let metadata_path =
             LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
-        if let Some(relish_storage) = &self.relish_storage {
-            relish_storage.upload_layer(LayerUpload {
+        crate::relish_storage::synced_storage::RELISH_STORAGE_SYNC_QUEUE.upload_layer(
+            LayerUpload {
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,
                 metadata_path,
                 disk_relishes: relishes_to_upload,
-            });
-        }
+            },
+        );
 
         // Also update the in-memory copy
         self.disk_consistent_lsn.store(disk_consistent_lsn);
