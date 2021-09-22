@@ -1,0 +1,124 @@
+name: benchmarking
+
+on:
+  push:
+    branches: [ feature/more-performance-tests ] # TODO change to main after debugging
+
+env:
+  BASE_URL: "https://console.zenith.tech"
+
+jobs:
+  bench:
+    # this workflow runs on self hosteed runner
+    # it's environment is quite different from usual guthub runner
+    # probably the most important difference is that it doesnt start from clean workspace each time
+    # e g if you install system packages they are not cleaned up since you install them directly in host machine
+    # not a container or something
+    # See documentation for more info: https://docs.github.com/en/actions/hosting-your-own-runners/about-self-hosted-runners
+    runs-on: self-hosted
+
+
+    steps:
+    - uses: actions/checkout@v2
+    # actions/setup-python@v2 is not working correctly on self-hosted runners
+    # see https://github.com/actions/setup-python/issues/162
+    # and probably https://github.com/actions/setup-python/issues/162#issuecomment-865387976 in particular
+    # so the simplest solution to me is to use already installed system python and spin virtualenvs for job runs.
+    # there is Python 3.7.10 already installed on the machine so use it to install pipenv and then use pipenv's virtuealenvs
+    - name: Install pipenv & deps
+      run: |
+        python3 -m pip install --upgrade pipenv wheel
+        # since pip/pipenv caches are reused there shouldn't be any troubles with install every time
+        pipenv lock
+        pipenv install
+        # because pipenv does not support flexible version constraints for python versions e.g. python_version >= 3.6
+        # and locally we generate lockfiles with higher versions some packages which are needed only for some earlier versions
+        # are not selected. In particular here is a problem with pytest dependency which required only for python < 3.8
+        # importlib-metadata>=0.12;python_version<"3.8"
+        # So the solutions are:
+        #  install a newer python version on a runner machine
+        #  just hack there installation of a needed dependency
+        #  use something different than pipenv which supports that case (poetry?)
+        # So I decided to hack it here and explore possible fixes separately in follow up changes
+        # TODO(LizzardWizzard)
+
+    - name: Setup cluster
+      env:
+        BENCHMARK_CONSOLE_USER_PASSWORD: "${{ secrets.BENCHMARK_CONSOLE_USER_PASSWORD }}"
+        BENCHMARK_CONSOLE_INVITE_CODE: "${{ secrets.BENCHMARK_CONSOLE_INVITE_CODE }}"
+      shell: bash
+      run: |
+        set -e
+        UNIQUE_ID=`date +%s` # needed because github preserves run id when job is restarted
+        USERNAME=benchmark-$GITHUB_SHA-$UNIQUE_ID
+
+        echo "Creating new user: $USERNAME"
+
+        CONSOLE_USER_ACCESS_TOKEN=$(curl -s --fail --show-error -i -X POST $BASE_URL/ \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "user[email]=$USERNAME" \
+          -d "user[password]=$BENCHMARK_CONSOLE_USER_PASSWORD" \
+          -d "user[password_confirmation]=$BENCHMARK_CONSOLE_USER_PASSWORD" \
+          -d "invite=$BENCHMARK_CONSOLE_INVITE_CODE" | grep Authorization | cut -d " " -f 3 | tr -d '\r\n')
+        # save token to stop the cluster after benchmark is completed
+        echo "CONSOLE_USER_ACCESS_TOKEN=$CONSOLE_USER_ACCESS_TOKEN" >> $GITHUB_ENV
+        echo "Creating cluster"
+
+        CLUSTER=$(curl -s --fail --show-error $BASE_URL/api/v1/clusters.json \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -H "Authorization: Bearer $CONSOLE_USER_ACCESS_TOKEN" \
+            --data-binary @- << EOF
+        {
+            "cluster": {
+                "name": "default_cluster",
+                "region_id": "2",
+                "instance_type_id": 7,
+                "settings": {}
+            },
+            "database": {"name": "benchmark"},
+            "role": {"name": "benchmark", "password": "$BENCHMARK_CONSOLE_USER_PASSWORD"}
+        }
+        EOF
+        )
+
+        echo "Created cluster"
+        echo $CLUSTER | python -m json.tool
+        echo "Waiting for cluster to become ready"
+        sleep 150
+
+        # note that jq is installed on host system
+        CLUSTER_ID=$(echo $CLUSTER| jq ".id")
+        echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
+        echo "Constructing connstr"
+        CLUSTER=$(curl -s --fail --show-error -X GET $BASE_URL/api/v1/clusters/$CLUSTER_ID.json \
+            -H "Authorization: Bearer $CONSOLE_USER_ACCESS_TOKEN")
+
+        echo $CLUSTER | python -m json.tool
+        CONNSTR=$(echo $CLUSTER | jq -r ".| \"postgresql://benchmark:$BENCHMARK_CONSOLE_USER_PASSWORD@\(.public_ip_address):\(.public_pg_port)/benchmark\"")
+        echo "BENCHMARK_CONNSTR=$CONNSTR" >> $GITHUB_ENV
+
+    - name: Run benchmark
+      # pgbench is installed system wide from official repo
+      # https://download.postgresql.org/pub/repos/yum/13/redhat/rhel-7-x86_64/
+      # via
+      # sudo tee /etc/yum.repos.d/pgdg.repo<<EOF
+      # [pgdg13]
+      # name=PostgreSQL 13 for RHEL/CentOS 7 - x86_64
+      # baseurl=https://download.postgresql.org/pub/repos/yum/13/redhat/rhel-7-x86_64/
+      # enabled=1
+      # gpgcheck=0
+      # EOF
+      # sudo yum makecache
+      # sudo yum install postgresql13-contrib
+      # actual binaries are located in /usr/pgsql-13/bin/
+      env:
+        PG_BIN: "/usr/pgsql-13/bin/"
+      run: |
+        mkdir -p perf_out
+        pipenv run pytest test_runner/performance/ -m "remote" --skip-interfering-proc-check --out-dir perf_out
+
+    - name: Stop cluster
+      if: ${{ always() }}
+      run: |
+        curl -s --fail --show-error -X POST $BASE_URL/api/v1/clusters/$CLUSTER_ID/stop \
+            -H "Authorization: Bearer $CONSOLE_USER_ACCESS_TOKEN"
