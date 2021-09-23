@@ -33,12 +33,12 @@ use std::{fs, thread};
 
 use crate::layered_repository::inmemory_layer::FreezeLayers;
 use crate::relish::*;
-use crate::relish_storage::synced_storage::{RelishStorageWithBackgroundSync, TimelineUpload};
 use crate::repository::{GcResult, Repository, Timeline, WALRecord};
 use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 
+use relish_storage::synced_storage::{RelishStorageWithBackgroundSync, TimelineUpload};
 use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
@@ -54,6 +54,7 @@ mod image_layer;
 mod inmemory_layer;
 mod interval_tree;
 mod layer_map;
+mod relish_storage;
 mod storage_layer;
 
 use delta_layer::DeltaLayer;
@@ -228,7 +229,7 @@ impl LayeredRepository {
                 };
 
                 let relish_storage =
-                    &crate::relish_storage::synced_storage::RELISH_STORAGE_WITH_BACKGROUND_SYNC;
+                    &relish_storage::synced_storage::RELISH_STORAGE_WITH_BACKGROUND_SYNC;
                 let mut timeline = LayeredTimeline::new(
                     self.conf,
                     metadata,
@@ -1048,6 +1049,7 @@ impl LayeredTimeline {
         timeline_files.delta_layers.sort();
         for (filename, layer_path) in timeline_files.delta_layers {
             disk_relishes.push(layer_path);
+            // TODO kb is this correct?
             disk_consistent_lsn = disk_consistent_lsn.max(Some(filename.end_lsn));
 
             let predecessor = layers.get(&filename.seg, filename.start_lsn);
@@ -1077,6 +1079,7 @@ impl LayeredTimeline {
 
         Ok(timeline_files.metadata.zip(disk_consistent_lsn).map(
             |(metadata_path, disk_consistent_lsn)| TimelineUpload {
+                tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,
                 metadata_path,
@@ -1455,6 +1458,7 @@ impl LayeredTimeline {
             LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
         if let Some(relish_storage) = &self.relish_storage {
             relish_storage.schedule_timeline_upload(TimelineUpload {
+                tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,
                 metadata_path,
