@@ -26,12 +26,12 @@ use super::filename::{DeltaFileName, ImageFileName};
 pub trait RelishStorage: Send + Sync {
     type RelishStoragePath: std::fmt::Debug;
 
-    fn derive_destination(
+    fn storage_path(
         page_server_workdir: &Path,
         relish_local_path: &Path,
     ) -> anyhow::Result<Self::RelishStoragePath>;
 
-    fn relish_info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo>;
+    fn info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo>;
 
     async fn list_relishes(&self) -> anyhow::Result<Vec<Self::RelishStoragePath>>;
 

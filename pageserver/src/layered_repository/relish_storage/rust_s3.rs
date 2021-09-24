@@ -56,7 +56,7 @@ impl RustS3 {
 impl RelishStorage for RustS3 {
     type RelishStoragePath = S3ObjectKey;
 
-    fn derive_destination(
+    fn storage_path(
         page_server_workdir: &Path,
         relish_local_path: &Path,
     ) -> anyhow::Result<Self::RelishStoragePath> {
@@ -69,7 +69,7 @@ impl RelishStorage for RustS3 {
         Ok(S3ObjectKey(key))
     }
 
-    fn relish_info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo> {
+    fn info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo> {
         parse_relish_data(split_relish_key_into_data_segments(relish), relish.key())
     }
 

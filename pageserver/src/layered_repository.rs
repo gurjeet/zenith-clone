@@ -39,7 +39,7 @@ use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 
-use relish_storage::synced_storage::{RelishStorageWithBackgroundSync, TimelineUpload};
+use relish_storage::synced_storage::{RelishStorageWithBackgroundSync, LocalTimeline};
 use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
@@ -1019,7 +1019,7 @@ impl LayeredTimeline {
     /// If any timeline data found in the directory,
     /// its metadata returned for external storage upload.
     ///
-    fn load_layer_map(&self) -> anyhow::Result<Option<TimelineUpload>> {
+    fn load_layer_map(&self) -> anyhow::Result<Option<LocalTimeline>> {
         info!(
             "loading layer map for timeline {} into memory",
             self.timelineid
@@ -1079,7 +1079,7 @@ impl LayeredTimeline {
         } = timeline_files;
         Ok(metadata
             .zip(disk_consistent_lsn)
-            .map(|(metadata_path, disk_consistent_lsn)| TimelineUpload {
+            .map(|(metadata_path, disk_consistent_lsn)| LocalTimeline {
                 tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,
@@ -1467,7 +1467,7 @@ impl LayeredTimeline {
         let metadata_path =
             LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
         if let Some(relish_storage) = &self.relish_storage {
-            relish_storage.schedule_timeline_upload(TimelineUpload {
+            relish_storage.schedule_timeline_upload(LocalTimeline {
                 tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,

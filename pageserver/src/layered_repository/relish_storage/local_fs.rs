@@ -53,14 +53,14 @@ impl LocalFs {
 impl RelishStorage for LocalFs {
     type RelishStoragePath = PathBuf;
 
-    fn derive_destination(
+    fn storage_path(
         page_server_workdir: &Path,
         relish_local_path: &Path,
     ) -> anyhow::Result<Self::RelishStoragePath> {
         Ok(strip_workspace_prefix(page_server_workdir, relish_local_path)?.to_path_buf())
     }
 
-    fn relish_info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo> {
+    fn info(relish: &Self::RelishStoragePath) -> anyhow::Result<RelishInfo> {
         parse_relish_data(
             split_relish_key_into_data_segments(relish),
             relish.to_string_lossy().as_ref(),
