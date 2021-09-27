@@ -79,7 +79,7 @@ fn parse_relish_data(
 ) -> anyhow::Result<RelishInfo> {
     let (tenant_id_str, timeline_id_str, relish_name_str) = match relish_data_segments {
         Some(data) => data,
-        None => bail!("Cannot path relish path '{}' into relish info", relish_key),
+        None => bail!("Cannot parse relish info out of the path '{}'", relish_key),
     };
     let tenant_id = tenant_id_str.parse::<ZTenantId>().with_context(|| {
         format!(

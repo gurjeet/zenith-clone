@@ -39,7 +39,7 @@ use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 
-use relish_storage::synced_storage::{RelishStorageWithBackgroundSync, LocalTimeline};
+use relish_storage::synced_storage::{LocalTimeline, RelishStorageWithBackgroundSync};
 use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
@@ -1028,10 +1028,7 @@ impl LayeredTimeline {
         let timeline_files =
             filename::list_timeline_files(self.conf, self.timelineid, self.tenantid)?;
 
-        let mut disk_consistent_lsn = None;
         for filename in &timeline_files.image_layers {
-            disk_consistent_lsn = disk_consistent_lsn.max(Some(filename.lsn));
-
             let layer = ImageLayer::new(self.conf, self.timelineid, self.tenantid, filename);
 
             info!(
@@ -1044,9 +1041,6 @@ impl LayeredTimeline {
         }
 
         for filename in &timeline_files.delta_layers {
-            // TODO kb is this correct?
-            disk_consistent_lsn = disk_consistent_lsn.max(Some(filename.end_lsn));
-
             let predecessor = layers.get(&filename.seg, filename.start_lsn);
 
             let predecessor_str: String = if let Some(prec) = &predecessor {
@@ -1077,16 +1071,14 @@ impl LayeredTimeline {
             image_layers,
             delta_layers,
         } = timeline_files;
-        Ok(metadata
-            .zip(disk_consistent_lsn)
-            .map(|(metadata_path, disk_consistent_lsn)| LocalTimeline {
-                tenant_id: self.tenantid,
-                timeline_id: self.timelineid,
-                disk_consistent_lsn,
-                metadata_path,
-                image_layers,
-                delta_layers,
-            }))
+        Ok(metadata.map(|metadata_path| LocalTimeline {
+            tenant_id: self.tenantid,
+            timeline_id: self.timelineid,
+            disk_consistent_lsn: self.disk_consistent_lsn.load(),
+            metadata_path,
+            image_layers,
+            delta_layers,
+        }))
     }
 
     ///

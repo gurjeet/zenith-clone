@@ -38,6 +38,7 @@ enum SyncTask {
 pub struct LocalTimeline {
     pub tenant_id: ZTenantId,
     pub timeline_id: ZTimelineId,
+    // TODO kb where to use it?
     pub disk_consistent_lsn: Lsn,
     pub metadata_path: PathBuf,
     pub image_layers: BTreeSet<ImageFileName>,
@@ -158,17 +159,15 @@ fn run_thread<P: std::fmt::Debug, S: 'static + RelishStorage<RelishStoragePath =
     thread::Builder::new()
         .name("Queue based relish storage sync".to_string())
         .spawn(move || {
-            // TODO kb determine the latest LSN timeline to download now, add all non-downloaded files to the queue
             let mut remote_timelines = categorize_relish_uploads::<P, S>(
                 runtime
                     .block_on(relish_storage.list_relishes())
                     .expect("Failed to list relish uploads"),
             );
-            // Now think of how Vec<P> is mapped against TimelineUpload data (we need to determine that the upload happened)
-            // (need to parse the uploaded paths at least)
-            // let mut uploads: HashMap<(ZTenantId, ZTimelineId), BTreeSet<Lsn>>
-            // downloads should go straight to queue
-            // let mut files_to_download: Vec<P>
+            let latest_tenant_timelines = latest_timelines_for_tenants(&remote_timelines);
+            // TODO kb download & load the timelines into the pageserver
+            log::warn!("@@@@@@@@@@@, {:?}", latest_tenant_timelines);
+
             loop {
                 match sync_tasks_queue.next() {
                     Some(task) => runtime.block_on(async {
@@ -212,6 +211,50 @@ fn run_thread<P: std::fmt::Debug, S: 'static + RelishStorage<RelishStoragePath =
                 };
             }
         })
+}
+
+fn latest_timelines_for_tenants(
+    remote_timelines: &HashMap<(ZTenantId, ZTimelineId), RemoteTimeline>,
+) -> HashMap<ZTenantId, ZTimelineId> {
+    let mut latest_timelines_for_tenants = HashMap::with_capacity(remote_timelines.len());
+
+    for ((remote_tenant_id, remote_timeline_id), remote_timeline_data) in remote_timelines {
+        let (latest_timeline_id, timeline_latest_lsn) = latest_timelines_for_tenants
+            .entry(remote_tenant_id)
+            .or_insert_with(|| {
+                (
+                    remote_timeline_id,
+                    latest_timeline_lsn(remote_timeline_data),
+                )
+            });
+        if latest_timeline_id != &remote_timeline_id {
+            let mut remote_latest_lsn = latest_timeline_lsn(remote_timeline_data);
+            if timeline_latest_lsn < &mut remote_latest_lsn {
+                *latest_timeline_id = remote_timeline_id;
+                *timeline_latest_lsn = remote_latest_lsn;
+            }
+        }
+    }
+
+    latest_timelines_for_tenants
+        .into_iter()
+        .map(|(&tenant_id, (&timeline_id, _))| (tenant_id, timeline_id))
+        .collect()
+}
+
+// TODO kb is this a correct thing to do?
+fn latest_timeline_lsn(timeline_data: &RemoteTimeline) -> Option<Lsn> {
+    let latest_timeline_delta_lsn = timeline_data
+        .delta_layers
+        .iter()
+        .map(|delta| delta.end_lsn)
+        .max();
+    let latest_timeline_image_lsn = timeline_data
+        .image_layers
+        .iter()
+        .map(|image| image.lsn)
+        .max();
+    latest_timeline_delta_lsn.max(latest_timeline_image_lsn)
 }
 
 fn categorize_relish_uploads<
