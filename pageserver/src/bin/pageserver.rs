@@ -15,6 +15,10 @@ use std::{
 };
 use zenith_utils::{auth::JwtAuth, logging, postgres_backend::AuthType};
 
+use signal_hook;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::{bail, ensure, Result};
 use clap::{App, Arg, ArgMatches};
 use daemonize::Daemonize;
@@ -396,6 +400,9 @@ fn main() -> Result<()> {
 }
 
 fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
+    let term = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
+
     // Initialize logger
     let (_scope_guard, log_file) = logging::init(LOG_FILE_NAME, conf.daemonize)?;
 
@@ -465,13 +472,24 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
 
     // Spawn a thread to listen for connections. It will spawn further threads
     // for each connection.
+    let term_pageservice = Arc::clone(&term);
     let page_service_thread = thread::Builder::new()
         .name("Page Service thread".into())
         .spawn(move || {
-            page_service::thread_main(conf, auth, pageserver_listener, conf.auth_type)
+            page_service::thread_main(
+                term_pageservice,
+                conf,
+                auth,
+                pageserver_listener,
+                conf.auth_type,
+            )
         })?;
 
     join_handles.push(page_service_thread);
+
+    while !term.load(Ordering::Relaxed) {}
+
+    tenant_mgr::shutdown_all_tenants()?;
 
     for handle in join_handles.into_iter() {
         handle

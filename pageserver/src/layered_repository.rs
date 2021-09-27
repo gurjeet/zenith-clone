@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::Write;
 use std::ops::Bound::Included;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -112,10 +112,24 @@ pub struct LayeredRepository {
 
     walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
     relish_uploader: Option<Arc<QueueBasedRelishUploader>>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 /// Public interface
 impl Repository for LayeredRepository {
+    fn shutdown(&self) -> Result<()> {
+        info!("LayeredRepository shutdown for tenant {}", self.tenantid);
+        self.shutdown_requested.swap(true, Ordering::Relaxed);
+        info!("shutdown requested");
+
+        let timelines = self.timelines.lock().unwrap();
+        for (timelineid, timeline) in timelines.iter() {
+            info!("repo shutdown. checkpoint timeline {}", timelineid);
+            timeline.checkpoint()?;
+        }
+        Ok(())
+    }
+
     fn get_timeline(&self, timelineid: ZTimelineId) -> Result<Arc<dyn Timeline>> {
         let mut timelines = self.timelines.lock().unwrap();
 
@@ -278,6 +292,7 @@ impl LayeredRepository {
             relish_uploader: conf.relish_storage_config.as_ref().map(|config| {
                 Arc::new(QueueBasedRelishUploader::new(config, &conf.workdir).unwrap())
             }),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -299,6 +314,12 @@ impl LayeredRepository {
     ///
     fn checkpoint_loop(&self, conf: &'static PageServerConf) -> Result<()> {
         loop {
+            let shutdown_requested = self.shutdown_requested.clone();
+
+            if shutdown_requested.load(Ordering::Relaxed) {
+                info!("Closing checkpointer thread!");
+                return Ok(());
+            }
             std::thread::sleep(conf.checkpoint_period);
             info!("checkpointer thread for tenant {} waking up", self.tenantid);
 
@@ -336,6 +357,11 @@ impl LayeredRepository {
     ///
     fn gc_loop(&self, conf: &'static PageServerConf) -> Result<()> {
         loop {
+            let shutdown_requested = self.shutdown_requested.clone();
+            if shutdown_requested.load(Ordering::Relaxed) {
+                info!("Closing gc thread!");
+                return Ok(());
+            }
             std::thread::sleep(conf.gc_period);
             info!("gc thread for tenant {} waking up", self.tenantid);
 

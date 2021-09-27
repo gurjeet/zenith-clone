@@ -44,6 +44,16 @@ pub fn init(conf: &'static PageServerConf) {
     }
 }
 
+pub fn shutdown_all_tenants() -> Result<()> {
+    let m = REPOSITORY.lock().unwrap();
+    for (tenantid, repo) in m.iter() {
+        info!("shutdown tenant {}", tenantid);
+        repo.shutdown()?;
+    }
+    info!("shutdown all tenants done");
+    Ok(())
+}
+
 pub fn create_repository_for_tenant(
     conf: &'static PageServerConf,
     tenantid: ZTenantId,

@@ -18,6 +18,7 @@ use regex::Regex;
 use std::net::TcpListener;
 use std::str;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::{io, net::TcpStream};
@@ -182,12 +183,15 @@ impl PagestreamBeMessage {
 /// Listens for connections, and launches a new handler thread for each.
 ///
 pub fn thread_main(
+    term: Arc<AtomicBool>,
     conf: &'static PageServerConf,
     auth: Option<Arc<JwtAuth>>,
     listener: TcpListener,
     auth_type: AuthType,
 ) -> anyhow::Result<()> {
-    loop {
+    let terminate = term.clone();
+
+    while !terminate.load(Ordering::Relaxed) {
         let (socket, peer_addr) = listener.accept()?;
         debug!("accepted connection from {}", peer_addr);
         socket.set_nodelay(true).unwrap();
@@ -198,6 +202,9 @@ pub fn thread_main(
             }
         });
     }
+
+    info!("page_service loop terminated");
+    Ok(())
 }
 
 fn page_service_conn_main(
@@ -625,6 +632,22 @@ impl postgres_backend::Handler for PageServerHandler {
             // important because psycopg2 executes "SET datestyle TO 'ISO'"
             // on connect
             pgb.write_message_noflush(&BeMessage::CommandComplete(b"SELECT 1"))?;
+        } else if query_string.starts_with("tenant_shutdown") {
+            let err = || anyhow!("invalid tenant_shutdown: '{}'", query_string);
+
+            // tenant_shutdown <tenantid>
+            let re = Regex::new(r"^tenant_shutdown ([[:xdigit:]]+)$").unwrap();
+            let caps = re.captures(query_string).ok_or_else(err)?;
+
+            self.check_permission(None)?;
+
+            let tenantid = ZTenantId::from_str(caps.get(1).unwrap().as_str())?;
+            let repo = tenant_mgr::get_repository_for_tenant(tenantid)?;
+
+            let _result = repo.shutdown()?;
+
+            pgb.write_message_noflush(&SINGLE_COL_ROWDESC)?
+                .write_message_noflush(&BeMessage::CommandComplete(b"SELECT 1"))?;
         } else if query_string.starts_with("do_gc ") {
             // Run GC immediately on given timeline.
             // FIXME: This is just for tests. See test_runner/batch_others/test_gc.py.
