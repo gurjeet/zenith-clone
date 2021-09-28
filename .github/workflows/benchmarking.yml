@@ -29,8 +29,7 @@ jobs:
       run: |
         python3 -m pip install --upgrade pipenv wheel
         # since pip/pipenv caches are reused there shouldn't be any troubles with install every time
-        pipenv lock
-        pipenv install
+
         # because pipenv does not support flexible version constraints for python versions e.g. python_version >= 3.6
         # and locally we generate lockfiles with higher versions some packages which are needed only for some earlier versions
         # are not selected. In particular here is a problem with pytest dependency which required only for python < 3.8
@@ -39,8 +38,11 @@ jobs:
         #  install a newer python version on a runner machine
         #  just hack there installation of a needed dependency
         #  use something different than pipenv which supports that case (poetry?)
-        # So I decided to hack it here and explore possible fixes separately in follow up changes
+        #  lock the dependency file every time so it resolves to current environment
+        # So I decided to lock dependencies every time and explore possible fixes separately in follow up changes
         # TODO(LizzardWizzard)
+        pipenv lock
+        pipenv install
 
     - name: Setup cluster
       env:

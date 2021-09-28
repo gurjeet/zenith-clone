@@ -11,6 +11,7 @@ requests = "*"
 pytest-xdist = "*"
 asyncpg = "*"
 psycopg2-binary = "*"
+cached-property = "*"
 
 [dev-packages]
 yapf = "*"
