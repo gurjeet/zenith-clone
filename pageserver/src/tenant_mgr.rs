@@ -1,11 +1,12 @@
 //! This module acts as a switchboard to access different repositories managed by this
 //! page server.
 
+use std::thread::JoinHandle;
 use std::{
     collections::HashMap,
     fs,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{mpsc::Receiver, Arc, Mutex},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,7 +17,7 @@ use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
 use crate::branches;
 use crate::layered_repository::LayeredRepository;
-use crate::relish_storage::StorageUploader;
+use crate::relish_storage::StorageAccessor;
 use crate::repository::{Repository, Timeline};
 use crate::walredo::PostgresRedoManager;
 use crate::PageServerConf;
@@ -26,9 +27,21 @@ lazy_static! {
         Mutex::new(HashMap::new());
 }
 
-pub fn init(conf: &'static PageServerConf, storage_uploader: Option<StorageUploader>) {
+pub fn init(
+    conf: &'static PageServerConf,
+    storage_accessor: Option<StorageAccessor>,
+) -> Option<JoinHandle<anyhow::Result<()>>> {
     let mut m = REPOSITORY.lock().unwrap();
-    let storage_uploader = storage_uploader.map(Arc::new);
+    let (storage_uploader, handle) = match storage_accessor {
+        Some(storage_accessor) => {
+            let handle = launch_download_listener_thread(storage_accessor.download_signal);
+            (
+                Some(Arc::new(storage_accessor.storage_uploader)),
+                Some(handle),
+            )
+        }
+        None => (None, None),
+    };
 
     for dir_entry in fs::read_dir(conf.tenants_path()).unwrap() {
         let tenantid =
@@ -50,6 +63,22 @@ pub fn init(conf: &'static PageServerConf, storage_uploader: Option<StorageUploa
         info!("initialized storage for tenant: {}", &tenantid);
         m.insert(tenantid, repo);
     }
+
+    handle
+}
+
+fn launch_download_listener_thread(
+    download_receiver: Receiver<(ZTenantId, ZTimelineId)>,
+) -> JoinHandle<anyhow::Result<()>> {
+    std::thread::Builder::new()
+        .name("Relish storage download listener thread".into())
+        .spawn(move || {
+            while let Ok((tenant_id, timeline_id)) = download_receiver.recv() {
+                // TODO kb update pageserver data
+            }
+            Ok(())
+        })
+        .unwrap()
 }
 
 pub fn create_repository_for_tenant(

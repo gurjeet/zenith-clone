@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::sync::mpsc::{Receiver, Sender};
 use std::{
     collections::{hash_map, BTreeSet, BinaryHeap, HashMap},
     path::Path,
@@ -31,11 +32,15 @@ use crate::{
 use super::RelishStorage;
 
 lazy_static::lazy_static! {
-    static ref UPLOAD_QUEUE: Arc<Mutex<BinaryHeap<SyncTask>>> =
-        Arc::new(Mutex::new(BinaryHeap::new()));
+    static ref UPLOAD_QUEUE: Mutex<BinaryHeap<SyncTask>> = Mutex::new(BinaryHeap::new());
 }
 
-pub struct StorageUploader {}
+pub struct StorageAccessor {
+    pub storage_uploader: StorageUploader,
+    pub download_signal: Receiver<(ZTenantId, ZTimelineId)>,
+}
+
+pub struct StorageUploader;
 
 impl StorageUploader {
     pub fn upload_relish(&self, local_timeline: LocalTimeline) {
@@ -53,7 +58,7 @@ enum SyncTask {
     Download(RemoteTimeline),
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RemoteTimeline {
     tenant_id: ZTenantId,
     timeline_id: ZTimelineId,
@@ -69,10 +74,11 @@ pub fn run_storage_sync_thread<
 >(
     config: &'static PageServerConf,
     relish_storage: S,
-) -> anyhow::Result<Option<(StorageUploader, thread::JoinHandle<anyhow::Result<()>>)>> {
+) -> anyhow::Result<Option<(StorageAccessor, thread::JoinHandle<anyhow::Result<()>>)>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
 
     let handle = thread::Builder::new()
         .name("Queue based relish storage sync".to_string())
@@ -82,9 +88,20 @@ pub fn run_storage_sync_thread<
                     .block_on(relish_storage.list_relishes())
                     .expect("Failed to list relish uploads"),
             );
-            let latest_tenant_timelines = latest_timelines_for_tenants(&remote_timelines);
-            // TODO kb download & load the timelines into the pageserver
-            log::warn!("@@@@@@@@@@@, {:?}", latest_tenant_timelines);
+
+            let urgent_downloads = latest_timelines_for_tenants(&remote_timelines)
+                .iter()
+                .filter_map(|(&tenant_id, &timeline_id)| {
+                    remote_timelines.get(&(tenant_id, timeline_id))
+                })
+                .cloned()
+                .map(SyncTask::UrgentDownload)
+                .collect::<Vec<_>>();
+            log::info!(
+                "Will download {} timelines to restore state",
+                urgent_downloads.len()
+            );
+            add_many_to_queue(urgent_downloads);
 
             loop {
                 let mut queue_accessor = UPLOAD_QUEUE.lock().unwrap();
@@ -95,12 +112,24 @@ pub fn run_storage_sync_thread<
                     Some(task) => runtime.block_on(async {
                         match task {
                             SyncTask::Download(download_data) => {
-                                download_timeline(config, &relish_storage, download_data, false)
-                                    .await
+                                download_timeline(
+                                    config,
+                                    &relish_storage,
+                                    download_data,
+                                    false,
+                                    &sender,
+                                )
+                                .await
                             }
                             SyncTask::UrgentDownload(download_data) => {
-                                download_timeline(config, &relish_storage, download_data, true)
-                                    .await
+                                download_timeline(
+                                    config,
+                                    &relish_storage,
+                                    download_data,
+                                    true,
+                                    &sender,
+                                )
+                                .await
                             }
                             SyncTask::Upload(layer_upload) => {
                                 upload_timeline(
@@ -120,7 +149,21 @@ pub fn run_storage_sync_thread<
                 };
             }
         })?;
-    Ok(Some((StorageUploader {}, handle)))
+    Ok(Some((
+        StorageAccessor {
+            storage_uploader: StorageUploader {},
+            download_signal: receiver,
+        },
+        handle,
+    )))
+}
+
+fn add_to_queue(task: SyncTask) {
+    UPLOAD_QUEUE.lock().unwrap().push(task)
+}
+
+fn add_many_to_queue(tasks: impl IntoIterator<Item = SyncTask>) {
+    UPLOAD_QUEUE.lock().unwrap().extend(tasks.into_iter())
 }
 
 fn latest_timelines_for_tenants(
@@ -223,6 +266,7 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
     relish_storage: &'a S,
     remote_timeline: RemoteTimeline,
     urgent: bool,
+    download_sender: &'a Sender<(ZTenantId, ZTimelineId)>,
 ) {
     let timeline_id = remote_timeline.timeline_id;
     let tenant_id = remote_timeline.tenant_id;
@@ -260,18 +304,27 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
     .await;
 
     match sync_result {
-        SyncResult::Success { .. } => {}
+        SyncResult::Success { .. } => {
+            if let Err(e) = download_sender.send((tenant_id, timeline_id)) {
+                log::error!(
+                    "Failed to send the download notification timeline {}, tenant {}, reason: {}",
+                    timeline_id,
+                    tenant_id,
+                    e,
+                );
+            }
+        }
         SyncResult::MetadataSyncError { .. } => {
             let download = RemoteTimeline {
                 image_layers: BTreeSet::new(),
                 delta_layers: BTreeSet::new(),
                 ..remote_timeline
             };
-            UPLOAD_QUEUE.lock().unwrap().push(if urgent {
+            add_to_queue(if urgent {
                 SyncTask::UrgentDownload(download)
             } else {
                 SyncTask::Download(download)
-            });
+            })
         }
         SyncResult::LayerSyncError {
             not_synced_image_layers,
@@ -283,7 +336,7 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
                 delta_layers: not_synced_delta_layers,
                 ..remote_timeline
             };
-            UPLOAD_QUEUE.lock().unwrap().push(if urgent {
+            add_to_queue(if urgent {
                 SyncTask::UrgentDownload(download)
             } else {
                 SyncTask::Download(download)

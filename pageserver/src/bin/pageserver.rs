@@ -463,12 +463,14 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
     // don't spawn threads before daemonizing
     let mut join_handles = vec![];
 
-    let storage_uploader = relish_storage::init_storage(conf)?.map(|(uploader, handle)| {
+    let storage_accessor = relish_storage::init_storage(conf)?.map(|(accessor, handle)| {
         join_handles.push(handle);
-        uploader
+        accessor
     });
     // Initialize tenant manager.
-    tenant_mgr::init(conf, storage_uploader);
+    if let Some(handle) = tenant_mgr::init(conf, storage_accessor) {
+        join_handles.push(handle);
+    }
 
     // initialize authentication for incoming connections
     let auth = match &conf.auth_type {

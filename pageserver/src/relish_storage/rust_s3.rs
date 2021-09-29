@@ -26,7 +26,6 @@ pub struct S3 {
 }
 
 impl S3 {
-    // TODO kb add prefix to allow sharing the same bucket with different pageservers
     /// Creates the relish storage tenant_id: (), timeline_id: (), kind: () , errors if incorrect AWS S3 configuration provided.
     pub fn new(aws_config: &S3Config) -> anyhow::Result<Self> {
         let region = aws_config

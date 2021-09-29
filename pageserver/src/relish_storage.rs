@@ -21,7 +21,7 @@ use anyhow::{bail, Context};
 use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
 use self::local_fs::LocalFs;
-pub use self::synced_storage::StorageUploader;
+pub use self::synced_storage::{StorageAccessor, StorageUploader};
 use crate::{
     layered_repository::{
         filename::{DeltaFileName, ImageFileName},
@@ -32,7 +32,7 @@ use crate::{
 
 pub fn init_storage(
     config: &'static PageServerConf,
-) -> anyhow::Result<Option<(StorageUploader, thread::JoinHandle<anyhow::Result<()>>)>> {
+) -> anyhow::Result<Option<(StorageAccessor, thread::JoinHandle<anyhow::Result<()>>)>> {
     // TODO kb revert
     // match &config.relish_storage_config {
     //     Some(RelishStorageConfig::LocalFs(root)) => {
