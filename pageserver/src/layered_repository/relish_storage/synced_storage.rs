@@ -249,71 +249,36 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
         remote_timeline.delta_layers.len(),
     );
 
-    // TODO kb put into config
-    let concurrent_download_limit = Arc::new(Semaphore::new(10));
-    let mut relish_downloads = FuturesUnordered::new();
+    let sync_result = synchronize_layers(
+        config,
+        relish_storage,
+        timeline_id,
+        tenant_id,
+        remote_timeline
+            .image_layers
+            .into_iter()
+            .map(Layer::Image)
+            .chain(remote_timeline.delta_layers.into_iter().map(Layer::Delta)),
+        SyncOperation::Download,
+    )
+    .await;
 
-    for download in remote_timeline
-        .image_layers
-        .into_iter()
-        .map(Layer::Image)
-        .chain(remote_timeline.delta_layers.into_iter().map(Layer::Delta))
+    if sync_result.failed_to_sync_image_layers.is_empty()
+        && sync_result.failed_to_sync_delta_layers.is_empty()
     {
-        let download_limit = Arc::clone(&concurrent_download_limit);
-        relish_downloads.push(async move {
-            let conf = PathOrConf::Conf(config);
-            let relish_local_path = match &download {
-                Layer::Image(image_name) => {
-                    ImageLayer::path_for(&conf, timeline_id, tenant_id, image_name)
-                }
-                Layer::Delta(delta_name) => {
-                    DeltaLayer::path_for(&conf, timeline_id, tenant_id, delta_name)
-                }
-            };
-            let permit = download_limit
-                .acquire()
-                .await
-                .expect("Semaphore is not closed yet");
-            let download_result =
-                download_relish(relish_storage, &config.workdir, &relish_local_path).await;
-            drop(permit);
-            (download, relish_local_path, download_result)
-        });
-    }
-
-    let mut failed_image_downloads = BTreeSet::new();
-    let mut failed_delta_downloads = BTreeSet::new();
-    while let Some((download, relish_local_path, relish_download_result)) =
-        relish_downloads.next().await
-    {
-        match relish_download_result {
-            Ok(()) => {
-                log::trace!(
-                    "Successfully downloaded relish '{}'",
-                    relish_local_path.display()
-                );
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to download relish '{}', reason: {}",
-                    relish_local_path.display(),
-                    e
-                );
-                match download {
-                    Layer::Image(image_name) => {
-                        failed_image_downloads.insert(image_name);
-                    }
-                    Layer::Delta(delta_name) => {
-                        failed_delta_downloads.insert(delta_name);
-                    }
-                }
-            }
-        }
-    }
-    concurrent_download_limit.close();
-
-    if failed_image_downloads.is_empty() && failed_delta_downloads.is_empty() {
-        log::debug!("Successfully downloaded all relishes");
+        log::debug!(
+            "Successfully uploaded all {} relishes",
+            sync_result.successfully_synced_image_layers.len()
+                + sync_result.successfully_synced_delta_layers.len(),
+        );
+        log::trace!(
+            "Uploaded image layers: {:?}",
+            sync_result.successfully_synced_image_layers
+        );
+        log::trace!(
+            "Uploaded delta layers: {:?}",
+            sync_result.successfully_synced_delta_layers
+        );
 
         match download_relish(relish_storage, &config.workdir, &metadata_path).await {
             // TODO kb how to load that into pageserver now?
@@ -339,12 +304,19 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
     } else {
         log::error!(
             "Failed to download {} image layers and {} delta layers, rescheduling the job",
-            failed_image_downloads.len(),
-            failed_delta_downloads.len(),
+            sync_result.failed_to_sync_image_layers.len(),
+            sync_result.failed_to_sync_delta_layers.len(),
         );
         let download = RemoteTimeline {
-            image_layers: failed_image_downloads,
-            delta_layers: failed_delta_downloads,
+            // TODO kb duplicates and awful
+            image_layers: sync_result
+                .failed_to_sync_image_layers
+                .into_iter()
+                .collect(),
+            delta_layers: sync_result
+                .failed_to_sync_delta_layers
+                .into_iter()
+                .collect(),
             ..remote_timeline
         };
         sync_tasks_queue.lock().unwrap().push(if urgent {
@@ -376,6 +348,7 @@ async fn download_relish<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     }
 }
 
+#[derive(Debug)]
 enum Layer {
     Image(ImageFileName),
     Delta(DeltaFileName),
@@ -413,80 +386,36 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
         }
     }
 
-    // TODO kb put into config
-    let concurrent_upload_limit = Arc::new(Semaphore::new(10));
-    let mut relish_uploads = FuturesUnordered::new();
+    let sync_result = synchronize_layers(
+        config,
+        relish_storage,
+        timeline_id,
+        tenant_id,
+        new_upload
+            .image_layers
+            .into_iter()
+            .map(Layer::Image)
+            .chain(new_upload.delta_layers.into_iter().map(Layer::Delta)),
+        SyncOperation::Upload,
+    )
+    .await;
 
-    for upload in new_upload
-        .image_layers
-        .into_iter()
-        .map(Layer::Image)
-        .chain(new_upload.delta_layers.into_iter().map(Layer::Delta))
+    if sync_result.failed_to_sync_image_layers.is_empty()
+        && sync_result.failed_to_sync_delta_layers.is_empty()
     {
-        let upload_limit = Arc::clone(&concurrent_upload_limit);
-        relish_uploads.push(async move {
-            let conf = PathOrConf::Conf(config);
-            let relish_local_path = match &upload {
-                Layer::Image(image_name) => {
-                    ImageLayer::path_for(&conf, timeline_id, tenant_id, image_name)
-                }
-                Layer::Delta(delta_name) => {
-                    DeltaLayer::path_for(&conf, timeline_id, tenant_id, delta_name)
-                }
-            };
-            let permit = upload_limit
-                .acquire()
-                .await
-                .expect("Semaphore is not closed yet");
-            let upload_result =
-                upload_relish(relish_storage, &config.workdir, &relish_local_path).await;
-            drop(permit);
-            (upload, relish_local_path, upload_result)
-        });
-    }
-
-    let mut failed_image_uploads = BTreeSet::new();
-    let mut failed_delta_uploads = BTreeSet::new();
-    let mut successful_image_uploads = BTreeSet::new();
-    let mut successful_delta_uploads = BTreeSet::new();
-    while let Some((upload, relish_local_path, relish_upload_result)) = relish_uploads.next().await
-    {
-        match relish_upload_result {
-            Ok(()) => {
-                log::trace!(
-                    "Successfully uploaded relish '{}'",
-                    relish_local_path.display()
-                );
-                match upload {
-                    Layer::Image(image_name) => {
-                        successful_image_uploads.insert(image_name);
-                    }
-                    Layer::Delta(delta_name) => {
-                        successful_delta_uploads.insert(delta_name);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to upload relish '{}', reason: {}",
-                    relish_local_path.display(),
-                    e
-                );
-                match upload {
-                    Layer::Image(image_name) => {
-                        failed_image_uploads.insert(image_name);
-                    }
-                    Layer::Delta(delta_name) => {
-                        failed_delta_uploads.insert(delta_name);
-                    }
-                }
-            }
-        }
-    }
-    concurrent_upload_limit.close();
-
-    if failed_image_uploads.is_empty() && failed_delta_uploads.is_empty() {
-        log::debug!("Successfully uploaded all relishes");
+        log::debug!(
+            "Successfully uploaded all {} relishes",
+            sync_result.successfully_synced_image_layers.len()
+                + sync_result.successfully_synced_delta_layers.len(),
+        );
+        log::trace!(
+            "Uploaded image layers: {:?}",
+            sync_result.successfully_synced_image_layers
+        );
+        log::trace!(
+            "Uploaded delta layers: {:?}",
+            sync_result.successfully_synced_delta_layers
+        );
 
         match upload_relish(relish_storage, &config.workdir, &new_upload.metadata_path).await {
             Ok(()) => {
@@ -503,10 +432,10 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
 
                 entry_to_update
                     .image_layers
-                    .extend(successful_image_uploads.into_iter());
+                    .extend(sync_result.successfully_synced_image_layers.into_iter());
                 entry_to_update
                     .delta_layers
-                    .extend(successful_delta_uploads.into_iter());
+                    .extend(sync_result.successfully_synced_delta_layers.into_iter());
             }
             Err(e) => {
                 log::error!(
@@ -526,16 +455,22 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
         }
     } else {
         log::error!(
-            "Failed to upload {} image layers and {} delta layers, rescheduling the job",
-            failed_image_uploads.len(),
-            failed_delta_uploads.len(),
+            "Failed to upload {} layers, rescheduling the job",
+            sync_result.failed_to_sync_image_layers.len()
+                + sync_result.failed_to_sync_delta_layers.len(),
         );
         sync_tasks_queue
             .lock()
             .unwrap()
             .push(SyncTask::Upload(LocalTimeline {
-                image_layers: failed_image_uploads,
-                delta_layers: failed_delta_uploads,
+                image_layers: sync_result
+                    .failed_to_sync_image_layers
+                    .into_iter()
+                    .collect(),
+                delta_layers: sync_result
+                    .failed_to_sync_delta_layers
+                    .into_iter()
+                    .collect(),
                 ..new_upload
             }));
     }
@@ -556,4 +491,102 @@ async fn upload_relish<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     relish_storage
         .upload_relish(&relish_local_path, &destination)
         .await
+}
+
+#[derive(Debug, Copy, Clone)]
+enum SyncOperation {
+    Download,
+    Upload,
+}
+
+#[derive(Debug)]
+struct SyncResult {
+    successfully_synced_image_layers: Vec<ImageFileName>,
+    successfully_synced_delta_layers: Vec<DeltaFileName>,
+    failed_to_sync_image_layers: Vec<ImageFileName>,
+    failed_to_sync_delta_layers: Vec<DeltaFileName>,
+}
+
+async fn synchronize_layers<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
+    config: &'static PageServerConf,
+    relish_storage: &S,
+    timeline_id: ZTimelineId,
+    tenant_id: ZTenantId,
+    layers: impl Iterator<Item = Layer>,
+    sync_operation: SyncOperation,
+) -> SyncResult {
+    let mut sync_operations = FuturesUnordered::new();
+    // TODO kb put into config
+    let concurrent_operations_limit = Arc::new(Semaphore::new(10));
+
+    for layer in layers {
+        let limit = Arc::clone(&concurrent_operations_limit);
+        sync_operations.push(async move {
+            let conf = PathOrConf::Conf(config);
+            let layer_local_path = match &layer {
+                Layer::Image(image_name) => {
+                    ImageLayer::path_for(&conf, timeline_id, tenant_id, image_name)
+                }
+                Layer::Delta(delta_name) => {
+                    DeltaLayer::path_for(&conf, timeline_id, tenant_id, delta_name)
+                }
+            };
+            let permit = limit.acquire().await.expect("Semaphore is not closed yet");
+            let sync_result = match sync_operation {
+                SyncOperation::Download => {
+                    download_relish(relish_storage, &config.workdir, &layer_local_path).await
+                }
+                SyncOperation::Upload => {
+                    upload_relish(relish_storage, &config.workdir, &layer_local_path).await
+                }
+            };
+            drop(permit);
+            (layer, layer_local_path, sync_result)
+        });
+    }
+
+    let mut successfully_synced_image_layers = Vec::with_capacity(sync_operations.len());
+    let mut successfully_synced_delta_layers = Vec::with_capacity(sync_operations.len());
+    let mut failed_to_sync_image_layers = Vec::with_capacity(sync_operations.len());
+    let mut failed_to_sync_delta_layers = Vec::with_capacity(sync_operations.len());
+    while let Some((layer, relish_local_path, relish_download_result)) =
+        sync_operations.next().await
+    {
+        match (layer, relish_download_result) {
+            (Layer::Image(image_layer), Ok(())) => {
+                successfully_synced_image_layers.push(image_layer)
+            }
+
+            (Layer::Image(image_layer), Err(e)) => {
+                log::error!(
+                    "Failed to sync ({:?}) image layer {} with local path '{}', reason: {}",
+                    sync_operation,
+                    image_layer,
+                    relish_local_path.display(),
+                    e,
+                );
+                failed_to_sync_image_layers.push(image_layer);
+            }
+            (Layer::Delta(delta_layer), Ok(())) => {
+                successfully_synced_delta_layers.push(delta_layer);
+            }
+            (Layer::Delta(delta_layer), Err(e)) => {
+                log::error!(
+                    "Failed to sync ({:?}) delta layer {} with local path '{}', reason: {}",
+                    sync_operation,
+                    delta_layer,
+                    relish_local_path.display(),
+                    e,
+                );
+                failed_to_sync_delta_layers.push(delta_layer);
+            }
+        }
+    }
+    concurrent_operations_limit.close();
+    SyncResult {
+        successfully_synced_image_layers,
+        successfully_synced_delta_layers,
+        failed_to_sync_image_layers,
+        failed_to_sync_delta_layers,
+    }
 }
