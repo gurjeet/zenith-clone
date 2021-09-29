@@ -1,5 +1,6 @@
+use std::cmp::Ordering;
 use std::{
-    collections::{BTreeSet, BinaryHeap, HashMap},
+    collections::{hash_map, BTreeSet, BinaryHeap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
     thread,
@@ -59,6 +60,7 @@ struct RemoteTimeline {
     has_metadata: bool,
     image_layers: BTreeSet<ImageFileName>,
     delta_layers: BTreeSet<DeltaFileName>,
+    disk_consistent_lsn: Option<Lsn>,
 }
 
 pub fn run_storage_sync_thread<
@@ -187,6 +189,7 @@ fn categorize_relish_uploads<
                             has_metadata: false,
                             tenant_id,
                             timeline_id,
+                            disk_consistent_lsn: None,
                         });
 
                 match relish_info.kind {
@@ -320,24 +323,62 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
     let timeline_id = new_upload.timeline_id;
     log::debug!("Uploading layers for timeline {}", timeline_id);
 
-    let uploaded_files = remote_timelines.get(&(tenant_id, timeline_id));
-    if let Some(uploaded_timeline_files) = uploaded_files {
-        new_upload.image_layers.retain(|path_to_upload| {
-            !uploaded_timeline_files
-                .image_layers
-                .contains(path_to_upload)
-        });
-        new_upload.delta_layers.retain(|path_to_upload| {
-            !uploaded_timeline_files
-                .delta_layers
-                .contains(path_to_upload)
-        });
-        if new_upload.image_layers.is_empty()
-            && new_upload.delta_layers.is_empty()
-            && uploaded_timeline_files.has_metadata
-        {
-            log::debug!("All layers are uploaded already");
-            return;
+    let new_lsn = new_upload.disk_consistent_lsn;
+    let uploaded_files = remote_timelines.entry((tenant_id, timeline_id));
+
+    if let hash_map::Entry::Occupied(o) = uploaded_files {
+        let uploaded_timeline_files = o.get();
+
+        match uploaded_timeline_files.disk_consistent_lsn {
+            None => {
+                // TODO kb this is wrong, but I don't want to store the latest lsn in s3 yet
+                log::debug!(
+                    "No disk consistent LSN found for the remote timeline, checking its files"
+                );
+                new_upload.image_layers.retain(|path_to_upload| {
+                    !uploaded_timeline_files
+                        .image_layers
+                        .contains(path_to_upload)
+                });
+                new_upload.delta_layers.retain(|path_to_upload| {
+                    !uploaded_timeline_files
+                        .delta_layers
+                        .contains(path_to_upload)
+                });
+                if new_upload.image_layers.is_empty()
+                    && new_upload.delta_layers.is_empty()
+                    && uploaded_timeline_files.has_metadata
+                {
+                    log::debug!("All layers are uploaded already");
+                    return;
+                }
+            }
+            Some(remote_lsn) => match new_lsn.cmp(&remote_lsn) {
+                Ordering::Less => {
+                    log::warn!(
+                        "Received LSN {} that's older than the storage one {}, not uploading",
+                        new_lsn,
+                        remote_lsn
+                    );
+                    return;
+                }
+                Ordering::Equal => {
+                    log::debug!(
+                        "Received a timeline with the same LSN {}, skipping the upload",
+                        remote_lsn
+                    );
+                    return;
+                }
+                Ordering::Greater => {
+                    log::debug!(
+                        "Received a timeline with newer LSN {} (storage LSN {}), updating the upload",
+                        new_lsn,
+                        remote_lsn
+                    );
+                    o.remove_entry();
+                    // TODO kb delete the storage entry too?
+                }
+            },
         }
     }
 
@@ -362,6 +403,7 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
             image_layers: BTreeSet::new(),
             delta_layers: BTreeSet::new(),
             has_metadata: false,
+            disk_consistent_lsn: Some(new_lsn),
             tenant_id,
             timeline_id,
         });

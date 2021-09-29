@@ -110,6 +110,7 @@ pub struct LocalTimeline {
     pub metadata_path: PathBuf,
     pub image_layers: BTreeSet<ImageFileName>,
     pub delta_layers: BTreeSet<DeltaFileName>,
+    pub disk_consistent_lsn: Lsn,
 }
 
 ///
@@ -1087,6 +1088,7 @@ impl LayeredTimeline {
             metadata_path,
             image_layers,
             delta_layers,
+            disk_consistent_lsn: self.disk_consistent_lsn.load(),
         }))
     }
 
@@ -1474,6 +1476,7 @@ impl LayeredTimeline {
                 metadata_path,
                 image_layers: image_layer_uploads,
                 delta_layers: delta_layer_uploads,
+                disk_consistent_lsn,
             });
         }
 

@@ -21,11 +21,11 @@ impl S3ObjectKey {
 }
 
 /// AWS S3 relish storage.
-pub struct RustS3 {
+pub struct S3 {
     bucket: Bucket,
 }
 
-impl RustS3 {
+impl S3 {
     // TODO kb add prefix to allow sharing the same bucket with different pageservers
     /// Creates the relish storage tenant_id: (), timeline_id: (), kind: () , errors if incorrect AWS S3 configuration provided.
     pub fn new(aws_config: &S3Config) -> anyhow::Result<Self> {
@@ -53,7 +53,7 @@ impl RustS3 {
 }
 
 #[async_trait::async_trait]
-impl RelishStorage for RustS3 {
+impl RelishStorage for S3 {
     type RelishStoragePath = S3ObjectKey;
 
     fn storage_path(
