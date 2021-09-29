@@ -1,17 +1,6 @@
 //! This module acts as a switchboard to access different repositories managed by this
 //! page server.
 
-use crate::branches;
-use crate::layered_repository::{
-    relish_storage::{local_fs::LocalFs, synced_storage::SyncTask},
-    LayeredRepository,
-};
-use crate::repository::{Repository, Timeline};
-use crate::walredo::PostgresRedoManager;
-use crate::PageServerConf;
-use anyhow::{anyhow, bail, Context, Result};
-use lazy_static::lazy_static;
-use log::info;
 use std::{
     collections::{BinaryHeap, HashMap},
     fs,
@@ -19,7 +8,19 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex},
 };
+
+use anyhow::{anyhow, bail, Context, Result};
+use lazy_static::lazy_static;
+use log::info;
+
 use zenith_utils::zid::{ZTenantId, ZTimelineId};
+
+use crate::branches;
+use crate::layered_repository::LayeredRepository;
+use crate::relish_storage::{local_fs::LocalFs, synced_storage, synced_storage::SyncTask};
+use crate::repository::{Repository, Timeline};
+use crate::walredo::PostgresRedoManager;
+use crate::PageServerConf;
 
 lazy_static! {
     static ref REPOSITORY: Mutex<HashMap<ZTenantId, Arc<dyn Repository>>> =
@@ -55,12 +56,9 @@ pub fn init(conf: &'static PageServerConf) {
     let relish_storage =
         LocalFs::new(PathBuf::from("/home/someonetoignore/Downloads/tmp_dir")).unwrap();
     // TODO kb move upwards
-    let zz = super::layered_repository::relish_storage::synced_storage::run_storage_sync_thread(
-        conf,
-        Arc::clone(&UPLOAD_QUEUE),
-        relish_storage,
-    )
-    .unwrap();
+    let zz =
+        synced_storage::run_storage_sync_thread(conf, Arc::clone(&UPLOAD_QUEUE), relish_storage)
+            .unwrap();
 
     let mut m = REPOSITORY.lock().unwrap();
 

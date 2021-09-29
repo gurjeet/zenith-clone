@@ -19,7 +19,7 @@ use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
 use crate::layered_repository::METADATA_FILE_NAME;
 
-use super::filename::{DeltaFileName, ImageFileName};
+use crate::layered_repository::filename::{DeltaFileName, ImageFileName};
 
 /// Storage (potentially remote) API to manage its state.
 #[async_trait::async_trait]

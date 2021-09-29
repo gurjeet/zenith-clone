@@ -1,11 +1,11 @@
-use zenith_utils::postgres_backend::AuthType;
-use zenith_utils::zid::{ZTenantId, ZTimelineId};
-
 use std::path::PathBuf;
 use std::time::Duration;
 
 use lazy_static::lazy_static;
+
 use zenith_metrics::{register_int_gauge_vec, IntGaugeVec};
+use zenith_utils::postgres_backend::AuthType;
+use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
 pub mod basebackup;
 pub mod branches;
@@ -13,6 +13,7 @@ pub mod http;
 pub mod layered_repository;
 pub mod page_service;
 pub mod relish;
+pub mod relish_storage;
 pub mod repository;
 pub mod restore_local_repo;
 pub mod tenant_mgr;

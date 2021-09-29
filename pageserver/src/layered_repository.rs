@@ -11,14 +11,6 @@
 //! parent timeline, and the last LSN that has been written to disk.
 //!
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use bookfile::Book;
-use bytes::Bytes;
-use lazy_static::lazy_static;
-use log::*;
-use postgres_ffi::pg_constants::BLCKSZ;
-use serde::{Deserialize, Serialize};
-
 use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -29,15 +21,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use crate::layered_repository::filename::TimelineFiles;
-use crate::layered_repository::inmemory_layer::FreezeLayers;
-use crate::relish::*;
-use crate::repository::{GcResult, Repository, Timeline, WALRecord};
-use crate::walredo::WalRedoManager;
-use crate::PageServerConf;
-use crate::{ZTenantId, ZTimelineId};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bookfile::Book;
+use bytes::Bytes;
+use lazy_static::lazy_static;
+use log::*;
+use serde::{Deserialize, Serialize};
 
-use relish_storage::synced_storage::LocalTimeline;
+use delta_layer::DeltaLayer;
+use image_layer::ImageLayer;
+use inmemory_layer::InMemoryLayer;
+use layer_map::LayerMap;
+use postgres_ffi::pg_constants::BLCKSZ;
+use storage_layer::{
+    Layer, PageReconstructData, PageReconstructResult, SegmentTag, RELISH_SEG_SIZE,
+};
 use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
@@ -46,27 +44,26 @@ use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use zenith_utils::seqwait::SeqWait;
 
+use crate::layered_repository::filename::TimelineFiles;
+use crate::layered_repository::inmemory_layer::FreezeLayers;
+use crate::relish::*;
+use crate::relish_storage::synced_storage::LocalTimeline;
+use crate::repository::{GcResult, Repository, Timeline, WALRecord};
+use crate::walredo::WalRedoManager;
+use crate::PageServerConf;
+use crate::{ZTenantId, ZTimelineId};
+
+use self::inmemory_layer::{NonWriteableError, WriteResult};
+
 mod blob;
-mod delta_layer;
-mod filename;
-mod image_layer;
+// TODO kb stands out, need to move upwards?
+pub mod delta_layer;
+pub mod filename;
+pub mod image_layer;
 mod inmemory_layer;
 mod interval_tree;
 mod layer_map;
-// TODO kb stands out, need something more abstract?
-pub mod relish_storage;
 mod storage_layer;
-
-use delta_layer::DeltaLayer;
-use image_layer::ImageLayer;
-
-use inmemory_layer::InMemoryLayer;
-use layer_map::LayerMap;
-use storage_layer::{
-    Layer, PageReconstructData, PageReconstructResult, SegmentTag, RELISH_SEG_SIZE,
-};
-
-use self::inmemory_layer::{NonWriteableError, WriteResult};
 
 static ZERO_PAGE: Bytes = Bytes::from_static(&[0u8; 8192]);
 

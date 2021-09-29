@@ -9,6 +9,7 @@ use std::{
 use anyhow::Context;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Semaphore;
+
 use zenith_utils::{
     lsn::Lsn,
     zid::{ZTenantId, ZTimelineId},
@@ -20,8 +21,8 @@ use crate::{
         filename::{DeltaFileName, ImageFileName, PathOrConf},
         image_layer::ImageLayer,
         metadata_path,
-        relish_storage::RelishKind,
     },
+    relish_storage::RelishKind,
     PageServerConf,
 };
 
