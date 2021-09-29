@@ -2,9 +2,8 @@
 //! page server.
 
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::HashMap,
     fs,
-    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -17,7 +16,7 @@ use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
 use crate::branches;
 use crate::layered_repository::LayeredRepository;
-use crate::relish_storage::{local_fs::LocalFs, synced_storage, synced_storage::SyncTask};
+use crate::relish_storage::StorageUploader;
 use crate::repository::{Repository, Timeline};
 use crate::walredo::PostgresRedoManager;
 use crate::PageServerConf;
@@ -25,42 +24,11 @@ use crate::PageServerConf;
 lazy_static! {
     static ref REPOSITORY: Mutex<HashMap<ZTenantId, Arc<dyn Repository>>> =
         Mutex::new(HashMap::new());
-    static ref UPLOAD_QUEUE: Arc<Mutex<BinaryHeap<SyncTask>>> =
-        Arc::new(Mutex::new(BinaryHeap::new()));
 }
 
-pub fn init(conf: &'static PageServerConf) {
-    // TODO kb revert
-    // match &config.relish_storage_config {
-    //     Some(RelishStorageConfig::LocalFs(root)) => {
-    //         let relish_storage = LocalFs::new(root.clone())?;
-    //         Ok(Some(run_thread(
-    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
-    //             relish_storage,
-    //             &config.workdir,
-    //         )?))
-    //     }
-    //     Some(RelishStorageConfig::AwsS3(s3_config)) => {
-    //         let relish_storage = RustS3::new(s3_config)?;
-    //         Ok(Some(run_thread(
-    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
-    //             relish_storage,
-    //             &config.workdir,
-    //         )?))
-    //     }
-    //     None => {
-    //         RELISH_STORAGE_WITH_BACKGROUND_SYNC.disable();
-    //         Ok(None)
-    //     }
-    // }
-    let relish_storage =
-        LocalFs::new(PathBuf::from("/home/someonetoignore/Downloads/tmp_dir")).unwrap();
-    // TODO kb move upwards
-    let zz =
-        synced_storage::run_storage_sync_thread(conf, Arc::clone(&UPLOAD_QUEUE), relish_storage)
-            .unwrap();
-
+pub fn init(conf: &'static PageServerConf, storage_uploader: Option<StorageUploader>) {
     let mut m = REPOSITORY.lock().unwrap();
+    let storage_uploader = storage_uploader.map(Arc::new);
 
     for dir_entry in fs::read_dir(conf.tenants_path()).unwrap() {
         let tenantid =
@@ -74,13 +42,7 @@ pub fn init(conf: &'static PageServerConf) {
             conf,
             Arc::new(walredo_mgr),
             tenantid,
-            // TODO kb
-            Some(Arc::new(|local_timeline| {
-                UPLOAD_QUEUE
-                    .lock()
-                    .unwrap()
-                    .push(SyncTask::Upload(local_timeline))
-            })),
+            storage_uploader.as_ref().map(Arc::clone),
         ));
         LayeredRepository::launch_checkpointer_thread(conf, repo.clone());
         LayeredRepository::launch_gc_thread(conf, repo.clone());

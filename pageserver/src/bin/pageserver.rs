@@ -3,7 +3,7 @@
 //
 
 use log::*;
-use pageserver::defaults::*;
+use pageserver::{defaults::*, relish_storage};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -459,11 +459,16 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
         }
     }
 
-    // Initialize tenant manager.
-    tenant_mgr::init(conf);
-
     // keep join handles for spawned threads
+    // don't spawn threads before daemonizing
     let mut join_handles = vec![];
+
+    let storage_uploader = relish_storage::init_storage(conf)?.map(|(uploader, handle)| {
+        join_handles.push(handle);
+        uploader
+    });
+    // Initialize tenant manager.
+    tenant_mgr::init(conf, storage_uploader);
 
     // initialize authentication for incoming connections
     let auth = match &conf.auth_type {

@@ -44,10 +44,10 @@ use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::{AtomicLsn, Lsn, RecordLsn};
 use zenith_utils::seqwait::SeqWait;
 
-use crate::layered_repository::filename::TimelineFiles;
+use crate::layered_repository::filename::{DeltaFileName, ImageFileName, TimelineFiles};
 use crate::layered_repository::inmemory_layer::FreezeLayers;
 use crate::relish::*;
-use crate::relish_storage::synced_storage::LocalTimeline;
+use crate::relish_storage::StorageUploader;
 use crate::repository::{GcResult, Repository, Timeline, WALRecord};
 use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
@@ -100,7 +100,17 @@ lazy_static! {
     .expect("failed to define a metric");
 }
 
+// TODO kb docs
 pub const METADATA_FILE_NAME: &str = "metadata";
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalTimeline {
+    pub tenant_id: ZTenantId,
+    pub timeline_id: ZTimelineId,
+    pub metadata_path: PathBuf,
+    pub image_layers: BTreeSet<ImageFileName>,
+    pub delta_layers: BTreeSet<DeltaFileName>,
+}
 
 ///
 /// Repository consists of multiple timelines. Keep them in a hash table.
@@ -111,7 +121,7 @@ pub struct LayeredRepository {
     timelines: Mutex<HashMap<ZTimelineId, Arc<LayeredTimeline>>>,
 
     walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
-    timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
+    storage_uploader: Option<Arc<StorageUploader>>,
 }
 
 /// Public interface
@@ -236,17 +246,17 @@ impl LayeredRepository {
                     self.tenantid,
                     Arc::clone(&self.walredo_mgr),
                     0, // init with 0 and update after layers are loaded,
-                    self.timeline_upload_callback.as_ref().map(Arc::clone),
+                    self.storage_uploader.as_ref().map(Arc::clone),
                 )?;
 
                 // List the layers on disk, and load them into the layer map
                 let latest_timeline_on_disk = timeline.load_layer_map()?;
-                if let Some((upload, timeline)) = self
-                    .timeline_upload_callback
-                    .as_ref()
+                if let Some((storage_uploader, timeline)) = self
+                    .storage_uploader
+                    .as_deref()
                     .zip(latest_timeline_on_disk)
                 {
-                    upload(timeline);
+                    storage_uploader.upload_relish(timeline);
                 }
 
                 // needs to be after load_layer_map
@@ -276,14 +286,14 @@ impl LayeredRepository {
         conf: &'static PageServerConf,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
         tenantid: ZTenantId,
-        timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
+        storage_uploader: Option<Arc<StorageUploader>>,
     ) -> LayeredRepository {
         LayeredRepository {
             tenantid,
             conf,
             timelines: Mutex::new(HashMap::new()),
             walredo_mgr,
-            timeline_upload_callback,
+            storage_uploader,
         }
     }
 
@@ -602,7 +612,7 @@ pub struct LayeredTimeline {
     current_logical_size_gauge: IntGauge,
 
     // TODO kb docs
-    timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
+    storage_uploader: Option<Arc<StorageUploader>>,
 }
 
 /// Public interface functions
@@ -984,7 +994,7 @@ impl LayeredTimeline {
         tenantid: ZTenantId,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
         current_logical_size: usize,
-        timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
+        storage_uploader: Option<Arc<StorageUploader>>,
     ) -> Result<LayeredTimeline> {
         let current_logical_size_gauge = LOGICAL_TIMELINE_SIZE
             .get_metric_with_label_values(&[&tenantid.to_string(), &timelineid.to_string()])
@@ -1008,7 +1018,7 @@ impl LayeredTimeline {
             ancestor_lsn: metadata.ancestor_lsn,
             current_logical_size: AtomicUsize::new(current_logical_size),
             current_logical_size_gauge,
-            timeline_upload_callback,
+            storage_uploader,
         };
         Ok(timeline)
     }
@@ -1074,7 +1084,6 @@ impl LayeredTimeline {
         Ok(metadata.map(|metadata_path| LocalTimeline {
             tenant_id: self.tenantid,
             timeline_id: self.timelineid,
-            disk_consistent_lsn: self.disk_consistent_lsn.load(),
             metadata_path,
             image_layers,
             delta_layers,
@@ -1458,11 +1467,10 @@ impl LayeredTimeline {
         };
         let metadata_path =
             LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
-        if let Some(upload) = &self.timeline_upload_callback {
-            upload(LocalTimeline {
+        if let Some(storage_uploader) = &self.storage_uploader {
+            storage_uploader.upload_relish(LocalTimeline {
                 tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
-                disk_consistent_lsn,
                 metadata_path,
                 image_layers: image_layer_uploads,
                 delta_layers: delta_layer_uploads,

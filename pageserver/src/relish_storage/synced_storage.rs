@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, BinaryHeap, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -15,6 +15,7 @@ use zenith_utils::{
     zid::{ZTenantId, ZTimelineId},
 };
 
+use crate::layered_repository::LocalTimeline;
 use crate::{
     layered_repository::{
         delta_layer::DeltaLayer,
@@ -28,31 +29,36 @@ use crate::{
 
 use super::RelishStorage;
 
+lazy_static::lazy_static! {
+    static ref UPLOAD_QUEUE: Arc<Mutex<BinaryHeap<SyncTask>>> =
+        Arc::new(Mutex::new(BinaryHeap::new()));
+}
+
+pub struct StorageUploader {}
+
+impl StorageUploader {
+    pub fn upload_relish(&self, local_timeline: LocalTimeline) {
+        UPLOAD_QUEUE
+            .lock()
+            .unwrap()
+            .push(SyncTask::Upload(local_timeline))
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SyncTask {
+enum SyncTask {
     UrgentDownload(RemoteTimeline),
     Upload(LocalTimeline),
     Download(RemoteTimeline),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LocalTimeline {
-    pub tenant_id: ZTenantId,
-    pub timeline_id: ZTimelineId,
-    // TODO kb where to use it?
-    pub disk_consistent_lsn: Lsn,
-    pub metadata_path: PathBuf,
-    pub image_layers: BTreeSet<ImageFileName>,
-    pub delta_layers: BTreeSet<DeltaFileName>,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RemoteTimeline {
-    pub tenant_id: ZTenantId,
-    pub timeline_id: ZTimelineId,
-    pub has_metadata: bool,
-    pub image_layers: BTreeSet<ImageFileName>,
-    pub delta_layers: BTreeSet<DeltaFileName>,
+struct RemoteTimeline {
+    tenant_id: ZTenantId,
+    timeline_id: ZTimelineId,
+    has_metadata: bool,
+    image_layers: BTreeSet<ImageFileName>,
+    delta_layers: BTreeSet<DeltaFileName>,
 }
 
 pub fn run_storage_sync_thread<
@@ -60,14 +66,13 @@ pub fn run_storage_sync_thread<
     S: 'static + RelishStorage<RelishStoragePath = P>,
 >(
     config: &'static PageServerConf,
-    sync_tasks_queue: Arc<Mutex<BinaryHeap<SyncTask>>>,
     relish_storage: S,
-) -> std::io::Result<thread::JoinHandle<()>> {
+) -> anyhow::Result<Option<(StorageUploader, thread::JoinHandle<anyhow::Result<()>>)>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    thread::Builder::new()
+    let handle = thread::Builder::new()
         .name("Queue based relish storage sync".to_string())
         .spawn(move || {
             let mut remote_timelines = categorize_relish_uploads::<P, S>(
@@ -80,7 +85,7 @@ pub fn run_storage_sync_thread<
             log::warn!("@@@@@@@@@@@, {:?}", latest_tenant_timelines);
 
             loop {
-                let mut queue_accessor = sync_tasks_queue.lock().unwrap();
+                let mut queue_accessor = UPLOAD_QUEUE.lock().unwrap();
                 log::debug!("Upload queue length: {}", queue_accessor.len());
                 let next_task = queue_accessor.pop();
                 drop(queue_accessor);
@@ -88,30 +93,17 @@ pub fn run_storage_sync_thread<
                     Some(task) => runtime.block_on(async {
                         match task {
                             SyncTask::Download(download_data) => {
-                                download_timeline(
-                                    config,
-                                    &sync_tasks_queue,
-                                    &relish_storage,
-                                    download_data,
-                                    false,
-                                )
-                                .await
+                                download_timeline(config, &relish_storage, download_data, false)
+                                    .await
                             }
                             SyncTask::UrgentDownload(download_data) => {
-                                download_timeline(
-                                    config,
-                                    &sync_tasks_queue,
-                                    &relish_storage,
-                                    download_data,
-                                    true,
-                                )
-                                .await
+                                download_timeline(config, &relish_storage, download_data, true)
+                                    .await
                             }
                             SyncTask::Upload(layer_upload) => {
                                 upload_timeline(
                                     config,
                                     &mut remote_timelines,
-                                    &sync_tasks_queue,
                                     &relish_storage,
                                     layer_upload,
                                 )
@@ -125,7 +117,8 @@ pub fn run_storage_sync_thread<
                     }
                 };
             }
-        })
+        })?;
+    Ok(Some((StorageUploader {}, handle)))
 }
 
 fn latest_timelines_for_tenants(
@@ -224,7 +217,6 @@ fn categorize_relish_uploads<
 
 async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
-    sync_tasks_queue: &'a Mutex<BinaryHeap<SyncTask>>,
     relish_storage: &'a S,
     remote_timeline: RemoteTimeline,
     urgent: bool,
@@ -272,7 +264,7 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
                 delta_layers: BTreeSet::new(),
                 ..remote_timeline
             };
-            sync_tasks_queue.lock().unwrap().push(if urgent {
+            UPLOAD_QUEUE.lock().unwrap().push(if urgent {
                 SyncTask::UrgentDownload(download)
             } else {
                 SyncTask::Download(download)
@@ -288,7 +280,7 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
                 delta_layers: not_synced_delta_layers,
                 ..remote_timeline
             };
-            sync_tasks_queue.lock().unwrap().push(if urgent {
+            UPLOAD_QUEUE.lock().unwrap().push(if urgent {
                 SyncTask::UrgentDownload(download)
             } else {
                 SyncTask::Download(download)
@@ -321,7 +313,6 @@ async fn download_relish<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
 async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
     remote_timelines: &'a mut HashMap<(ZTenantId, ZTimelineId), RemoteTimeline>,
-    sync_tasks_queue: &'a Mutex<BinaryHeap<SyncTask>>,
     relish_storage: &'a S,
     mut new_upload: LocalTimeline,
 ) {
@@ -397,7 +388,7 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
             entry_to_update
                 .delta_layers
                 .extend(synced_delta_layers.into_iter());
-            sync_tasks_queue
+            UPLOAD_QUEUE
                 .lock()
                 .unwrap()
                 .push(SyncTask::Upload(LocalTimeline {
@@ -418,7 +409,7 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
             entry_to_update
                 .delta_layers
                 .extend(synced_delta_layers.into_iter());
-            sync_tasks_queue
+            UPLOAD_QUEUE
                 .lock()
                 .unwrap()
                 .push(SyncTask::Upload(LocalTimeline {

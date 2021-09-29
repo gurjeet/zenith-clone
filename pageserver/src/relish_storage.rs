@@ -6,20 +6,60 @@
 //! The abstractions hide multiple custom external storage API implementations,
 //! such as AWS S3, local filesystem, etc., located in the submodules.
 
-pub mod local_fs;
-pub mod rust_s3;
+mod local_fs;
+mod rust_s3;
 /// A queue-based storage with the background machinery behind it to synchronize
 /// local page server layer files with external storage.
-pub mod synced_storage;
+mod synced_storage;
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    thread,
+};
 
 use anyhow::{bail, Context};
 use zenith_utils::zid::{ZTenantId, ZTimelineId};
 
-use crate::layered_repository::METADATA_FILE_NAME;
+use self::local_fs::LocalFs;
+pub use self::synced_storage::StorageUploader;
+use crate::{
+    layered_repository::{
+        filename::{DeltaFileName, ImageFileName},
+        METADATA_FILE_NAME,
+    },
+    PageServerConf,
+};
 
-use crate::layered_repository::filename::{DeltaFileName, ImageFileName};
+pub fn init_storage(
+    config: &'static PageServerConf,
+) -> anyhow::Result<Option<(StorageUploader, thread::JoinHandle<anyhow::Result<()>>)>> {
+    // TODO kb revert
+    // match &config.relish_storage_config {
+    //     Some(RelishStorageConfig::LocalFs(root)) => {
+    //         let relish_storage = LocalFs::new(root.clone())?;
+    //         Ok(Some(run_thread(
+    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
+    //             relish_storage,
+    //             &config.workdir,
+    //         )?))
+    //     }
+    //     Some(RelishStorageConfig::AwsS3(s3_config)) => {
+    //         let relish_storage = RustS3::new(s3_config)?;
+    //         Ok(Some(run_thread(
+    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
+    //             relish_storage,
+    //             &config.workdir,
+    //         )?))
+    //     }
+    //     None => {
+    //         RELISH_STORAGE_WITH_BACKGROUND_SYNC.disable();
+    //         Ok(None)
+    //     }
+    // }
+    let relish_storage =
+        LocalFs::new(PathBuf::from("/home/someonetoignore/Downloads/tmp_dir")).unwrap();
+    synced_storage::run_storage_sync_thread(config, relish_storage)
+}
 
 /// Storage (potentially remote) API to manage its state.
 #[async_trait::async_trait]
