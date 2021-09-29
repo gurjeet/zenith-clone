@@ -221,7 +221,6 @@ fn categorize_relish_uploads<
     timelines
 }
 
-// TODO kb very much duplicates the corresponding upload counterpart
 async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
     sync_tasks_queue: &'a Mutex<BinaryHeap<SyncTask>>,
@@ -259,71 +258,41 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
             .into_iter()
             .map(Layer::Image)
             .chain(remote_timeline.delta_layers.into_iter().map(Layer::Delta)),
+        &metadata_path,
         SyncOperation::Download,
     )
     .await;
 
-    if sync_result.failed_to_sync_image_layers.is_empty()
-        && sync_result.failed_to_sync_delta_layers.is_empty()
-    {
-        log::debug!(
-            "Successfully uploaded all {} relishes",
-            sync_result.successfully_synced_image_layers.len()
-                + sync_result.successfully_synced_delta_layers.len(),
-        );
-        log::trace!(
-            "Uploaded image layers: {:?}",
-            sync_result.successfully_synced_image_layers
-        );
-        log::trace!(
-            "Uploaded delta layers: {:?}",
-            sync_result.successfully_synced_delta_layers
-        );
-
-        match download_relish(relish_storage, &config.workdir, &metadata_path).await {
-            // TODO kb how to load that into pageserver now?
-            Ok(()) => log::debug!("Successfully downloaded the metadata file"),
-            Err(e) => {
-                log::error!(
-                    "Failed to download metadata file '{}', reason: {}",
-                    metadata_path.display(),
-                    e
-                );
-                let download = RemoteTimeline {
-                    image_layers: BTreeSet::new(),
-                    delta_layers: BTreeSet::new(),
-                    ..remote_timeline
-                };
-                sync_tasks_queue.lock().unwrap().push(if urgent {
-                    SyncTask::UrgentDownload(download)
-                } else {
-                    SyncTask::Download(download)
-                });
-            }
+    match sync_result {
+        SyncResult::Success { .. } => {}
+        SyncResult::MetadataSyncError { .. } => {
+            let download = RemoteTimeline {
+                image_layers: BTreeSet::new(),
+                delta_layers: BTreeSet::new(),
+                ..remote_timeline
+            };
+            sync_tasks_queue.lock().unwrap().push(if urgent {
+                SyncTask::UrgentDownload(download)
+            } else {
+                SyncTask::Download(download)
+            });
         }
-    } else {
-        log::error!(
-            "Failed to download {} image layers and {} delta layers, rescheduling the job",
-            sync_result.failed_to_sync_image_layers.len(),
-            sync_result.failed_to_sync_delta_layers.len(),
-        );
-        let download = RemoteTimeline {
-            // TODO kb duplicates and awful
-            image_layers: sync_result
-                .failed_to_sync_image_layers
-                .into_iter()
-                .collect(),
-            delta_layers: sync_result
-                .failed_to_sync_delta_layers
-                .into_iter()
-                .collect(),
-            ..remote_timeline
-        };
-        sync_tasks_queue.lock().unwrap().push(if urgent {
-            SyncTask::UrgentDownload(download)
-        } else {
-            SyncTask::Download(download)
-        });
+        SyncResult::LayerSyncError {
+            not_synced_image_layers,
+            not_synced_delta_layers,
+            ..
+        } => {
+            let download = RemoteTimeline {
+                image_layers: not_synced_image_layers,
+                delta_layers: not_synced_delta_layers,
+                ..remote_timeline
+            };
+            sync_tasks_queue.lock().unwrap().push(if urgent {
+                SyncTask::UrgentDownload(download)
+            } else {
+                SyncTask::Download(download)
+            });
+        }
     }
 }
 
@@ -346,12 +315,6 @@ async fn download_relish<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
             .download_relish(&storage_path, relish_local_path)
             .await
     }
-}
-
-#[derive(Debug)]
-enum Layer {
-    Image(ImageFileName),
-    Delta(DeltaFileName),
 }
 
 async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
@@ -396,83 +359,73 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
             .into_iter()
             .map(Layer::Image)
             .chain(new_upload.delta_layers.into_iter().map(Layer::Delta)),
+        &new_upload.metadata_path,
         SyncOperation::Upload,
     )
     .await;
 
-    if sync_result.failed_to_sync_image_layers.is_empty()
-        && sync_result.failed_to_sync_delta_layers.is_empty()
-    {
-        log::debug!(
-            "Successfully uploaded all {} relishes",
-            sync_result.successfully_synced_image_layers.len()
-                + sync_result.successfully_synced_delta_layers.len(),
-        );
-        log::trace!(
-            "Uploaded image layers: {:?}",
-            sync_result.successfully_synced_image_layers
-        );
-        log::trace!(
-            "Uploaded delta layers: {:?}",
-            sync_result.successfully_synced_delta_layers
-        );
-
-        match upload_relish(relish_storage, &config.workdir, &new_upload.metadata_path).await {
-            Ok(()) => {
-                log::debug!("Successfully uploaded the metadata file");
-                let entry_to_update = remote_timelines
-                    .entry((tenant_id, timeline_id))
-                    .or_insert_with(|| RemoteTimeline {
-                        image_layers: BTreeSet::new(),
-                        delta_layers: BTreeSet::new(),
-                        has_metadata: true,
-                        tenant_id,
-                        timeline_id,
-                    });
-
-                entry_to_update
-                    .image_layers
-                    .extend(sync_result.successfully_synced_image_layers.into_iter());
-                entry_to_update
-                    .delta_layers
-                    .extend(sync_result.successfully_synced_delta_layers.into_iter());
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to upload metadata file '{}', reason: {}",
-                    new_upload.metadata_path.display(),
-                    e
-                );
-                sync_tasks_queue
-                    .lock()
-                    .unwrap()
-                    .push(SyncTask::Upload(LocalTimeline {
-                        image_layers: BTreeSet::new(),
-                        delta_layers: BTreeSet::new(),
-                        ..new_upload
-                    }));
-            }
+    let entry_to_update = remote_timelines
+        .entry((tenant_id, timeline_id))
+        .or_insert_with(|| RemoteTimeline {
+            image_layers: BTreeSet::new(),
+            delta_layers: BTreeSet::new(),
+            has_metadata: false,
+            tenant_id,
+            timeline_id,
+        });
+    match sync_result {
+        SyncResult::Success {
+            synced_image_layers,
+            synced_delta_layers,
+        } => {
+            entry_to_update
+                .image_layers
+                .extend(synced_image_layers.into_iter());
+            entry_to_update.has_metadata = true;
+            entry_to_update
+                .delta_layers
+                .extend(synced_delta_layers.into_iter());
         }
-    } else {
-        log::error!(
-            "Failed to upload {} layers, rescheduling the job",
-            sync_result.failed_to_sync_image_layers.len()
-                + sync_result.failed_to_sync_delta_layers.len(),
-        );
-        sync_tasks_queue
-            .lock()
-            .unwrap()
-            .push(SyncTask::Upload(LocalTimeline {
-                image_layers: sync_result
-                    .failed_to_sync_image_layers
-                    .into_iter()
-                    .collect(),
-                delta_layers: sync_result
-                    .failed_to_sync_delta_layers
-                    .into_iter()
-                    .collect(),
-                ..new_upload
-            }));
+        SyncResult::MetadataSyncError {
+            synced_image_layers,
+            synced_delta_layers,
+        } => {
+            entry_to_update
+                .image_layers
+                .extend(synced_image_layers.into_iter());
+            entry_to_update
+                .delta_layers
+                .extend(synced_delta_layers.into_iter());
+            sync_tasks_queue
+                .lock()
+                .unwrap()
+                .push(SyncTask::Upload(LocalTimeline {
+                    image_layers: BTreeSet::new(),
+                    delta_layers: BTreeSet::new(),
+                    ..new_upload
+                }));
+        }
+        SyncResult::LayerSyncError {
+            synced_image_layers,
+            synced_delta_layers,
+            not_synced_image_layers,
+            not_synced_delta_layers,
+        } => {
+            entry_to_update
+                .image_layers
+                .extend(synced_image_layers.into_iter());
+            entry_to_update
+                .delta_layers
+                .extend(synced_delta_layers.into_iter());
+            sync_tasks_queue
+                .lock()
+                .unwrap()
+                .push(SyncTask::Upload(LocalTimeline {
+                    image_layers: not_synced_image_layers,
+                    delta_layers: not_synced_delta_layers,
+                    ..new_upload
+                }));
+        }
     }
 }
 
@@ -493,6 +446,12 @@ async fn upload_relish<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
         .await
 }
 
+#[derive(Debug)]
+enum Layer {
+    Image(ImageFileName),
+    Delta(DeltaFileName),
+}
+
 #[derive(Debug, Copy, Clone)]
 enum SyncOperation {
     Download,
@@ -500,19 +459,30 @@ enum SyncOperation {
 }
 
 #[derive(Debug)]
-struct SyncResult {
-    successfully_synced_image_layers: Vec<ImageFileName>,
-    successfully_synced_delta_layers: Vec<DeltaFileName>,
-    failed_to_sync_image_layers: Vec<ImageFileName>,
-    failed_to_sync_delta_layers: Vec<DeltaFileName>,
+enum SyncResult {
+    Success {
+        synced_image_layers: Vec<ImageFileName>,
+        synced_delta_layers: Vec<DeltaFileName>,
+    },
+    MetadataSyncError {
+        synced_image_layers: Vec<ImageFileName>,
+        synced_delta_layers: Vec<DeltaFileName>,
+    },
+    LayerSyncError {
+        synced_image_layers: Vec<ImageFileName>,
+        synced_delta_layers: Vec<DeltaFileName>,
+        not_synced_image_layers: BTreeSet<ImageFileName>,
+        not_synced_delta_layers: BTreeSet<DeltaFileName>,
+    },
 }
 
-async fn synchronize_layers<P, S: 'static + RelishStorage<RelishStoragePath = P>>(
+async fn synchronize_layers<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
-    relish_storage: &S,
+    relish_storage: &'a S,
     timeline_id: ZTimelineId,
     tenant_id: ZTenantId,
     layers: impl Iterator<Item = Layer>,
+    metadata_path: &'a Path,
     sync_operation: SyncOperation,
 ) -> SyncResult {
     let mut sync_operations = FuturesUnordered::new();
@@ -545,18 +515,15 @@ async fn synchronize_layers<P, S: 'static + RelishStorage<RelishStoragePath = P>
         });
     }
 
-    let mut successfully_synced_image_layers = Vec::with_capacity(sync_operations.len());
-    let mut successfully_synced_delta_layers = Vec::with_capacity(sync_operations.len());
-    let mut failed_to_sync_image_layers = Vec::with_capacity(sync_operations.len());
-    let mut failed_to_sync_delta_layers = Vec::with_capacity(sync_operations.len());
+    let mut synced_image_layers = Vec::with_capacity(sync_operations.len());
+    let mut synced_delta_layers = Vec::with_capacity(sync_operations.len());
+    let mut not_synced_image_layers = BTreeSet::new();
+    let mut not_synced_delta_layers = BTreeSet::new();
     while let Some((layer, relish_local_path, relish_download_result)) =
         sync_operations.next().await
     {
         match (layer, relish_download_result) {
-            (Layer::Image(image_layer), Ok(())) => {
-                successfully_synced_image_layers.push(image_layer)
-            }
-
+            (Layer::Image(image_layer), Ok(())) => synced_image_layers.push(image_layer),
             (Layer::Image(image_layer), Err(e)) => {
                 log::error!(
                     "Failed to sync ({:?}) image layer {} with local path '{}', reason: {}",
@@ -565,10 +532,10 @@ async fn synchronize_layers<P, S: 'static + RelishStorage<RelishStoragePath = P>
                     relish_local_path.display(),
                     e,
                 );
-                failed_to_sync_image_layers.push(image_layer);
+                not_synced_image_layers.insert(image_layer);
             }
             (Layer::Delta(delta_layer), Ok(())) => {
-                successfully_synced_delta_layers.push(delta_layer);
+                synced_delta_layers.push(delta_layer);
             }
             (Layer::Delta(delta_layer), Err(e)) => {
                 log::error!(
@@ -578,15 +545,54 @@ async fn synchronize_layers<P, S: 'static + RelishStorage<RelishStoragePath = P>
                     relish_local_path.display(),
                     e,
                 );
-                failed_to_sync_delta_layers.push(delta_layer);
+                not_synced_delta_layers.insert(delta_layer);
             }
         }
     }
     concurrent_operations_limit.close();
-    SyncResult {
-        successfully_synced_image_layers,
-        successfully_synced_delta_layers,
-        failed_to_sync_image_layers,
-        failed_to_sync_delta_layers,
+
+    if not_synced_image_layers.is_empty() && not_synced_delta_layers.is_empty() {
+        log::debug!(
+            "Successfully uploaded all {} relishes",
+            synced_image_layers.len() + synced_delta_layers.len(),
+        );
+        log::trace!("Uploaded image layers: {:?}", synced_image_layers);
+        log::trace!("Uploaded delta layers: {:?}", synced_delta_layers);
+        let metadata_sync_result = match sync_operation {
+            SyncOperation::Download => {
+                download_relish(relish_storage, &config.workdir, &metadata_path).await
+            }
+            SyncOperation::Upload => {
+                upload_relish(relish_storage, &config.workdir, &metadata_path).await
+            }
+        };
+        match metadata_sync_result {
+            Ok(()) => {
+                log::debug!("Metadata file synced successfully");
+                SyncResult::Success {
+                    synced_image_layers,
+                    synced_delta_layers,
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to sync ({:?} metadata file with local path '{}', reason: {}",
+                    sync_operation,
+                    metadata_path.display(),
+                    e
+                );
+                SyncResult::MetadataSyncError {
+                    synced_image_layers,
+                    synced_delta_layers,
+                }
+            }
+        }
+    } else {
+        SyncResult::LayerSyncError {
+            synced_image_layers,
+            synced_delta_layers,
+            not_synced_delta_layers,
+            not_synced_image_layers,
+        }
     }
 }
