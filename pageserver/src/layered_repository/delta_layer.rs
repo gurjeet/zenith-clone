@@ -399,7 +399,7 @@ impl DeltaLayer {
         end_lsn: Lsn,
         dropped: bool,
         predecessor: Option<Arc<dyn Layer>>,
-        page_versions: impl Iterator<Item = (&'a (u32, Lsn), &'a PageVersion)>,
+        page_versions: impl Iterator<Item = (&'a u32, &'a Lsn, &'a PageVersion)>,
         relsizes: OrderedVec<Lsn, u32>,
     ) -> Result<DeltaLayer> {
         let delta_layer = DeltaLayer {
@@ -432,7 +432,7 @@ impl DeltaLayer {
 
         let mut page_version_writer = BlobWriter::new(book, PAGE_VERSIONS_CHAPTER);
 
-        for (key, page_version) in page_versions {
+        for (blknum, lsn, page_version) in page_versions {
             let page_image_range = page_version
                 .page_image
                 .as_ref()
@@ -449,7 +449,7 @@ impl DeltaLayer {
                 .transpose()?;
 
             inner.page_version_metas.append(
-                *key,
+                (*blknum, *lsn),
                 PageVersionMeta {
                     page_image_range,
                     record_range,
