@@ -17,9 +17,18 @@ jobs:
     # See documentation for more info: https://docs.github.com/en/actions/hosting-your-own-runners/about-self-hosted-runners
     runs-on: self-hosted
 
-
     steps:
-    - uses: actions/checkout@v2
+    - name: Checkout zenith repo
+      uses: actions/checkout@v2
+
+    - name: Checkout zenith-perf-data repo
+      uses: actions/checkout@v2
+      with:
+        repository: zenithdb/zenith-perf-data
+        token: ${{ secrets.LIZARD_WIZZARD_BENCHMARK_TOKEN }} # TODO temporary access token before we have dedicated automation user
+        ref: testing # TODO replace with master once everything is ready
+        path: zenith-perf-data
+
     # actions/setup-python@v2 is not working correctly on self-hosted runners
     # see https://github.com/actions/setup-python/issues/162
     # and probably https://github.com/actions/setup-python/issues/162#issuecomment-865387976 in particular
@@ -115,9 +124,14 @@ jobs:
       # actual binaries are located in /usr/pgsql-13/bin/
       env:
         PG_BIN: "/usr/pgsql-13/bin/"
+        LIZARD_WIZZARD_BENCHMARK_TOKEN: "${{ secrets.LIZARD_WIZZARD_BENCHMARK_TOKEN }}"
       run: |
-        mkdir -p perf_out
-        pipenv run pytest test_runner/performance/ -m "remote" --skip-interfering-proc-check --out-dir perf_out
+        mkdir -p zenith-perf-data/data
+        pipenv run pytest test_runner/performance/ -m "remote" --skip-interfering-proc-check --out-dir zenith-perf-data/data
+        cd zenith-perf-data
+        git add data
+        git commit -m "add performance test result for $GITHUB_SHA zenith revision"
+        git push https://$LIZARD_WIZZARD_BENCHMARK_TOKEN@github.com/zenithdb/zenith-perf-data.git testing
 
     - name: Stop cluster
       if: ${{ always() }}
