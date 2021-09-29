@@ -65,6 +65,7 @@ use bookfile::{Book, BookWriter};
 
 use zenith_utils::bin_ser::BeSer;
 use zenith_utils::lsn::Lsn;
+use zenith_utils::ordered_vec::OrderedVec;
 
 use super::blob::{read_blob, BlobRange};
 
@@ -155,7 +156,7 @@ pub struct DeltaLayerInner {
     page_version_metas: BTreeMap<(u32, Lsn), PageVersionMeta>,
 
     /// `relsizes` tracks the size of the relation at different points in time.
-    relsizes: BTreeMap<Lsn, u32>,
+    relsizes: OrderedVec<Lsn, u32>,
 }
 
 impl Layer for DeltaLayer {
@@ -276,10 +277,10 @@ impl Layer for DeltaLayer {
 
         // Scan the BTreeMap backwards, starting from the given entry.
         let inner = self.load()?;
-        let mut iter = inner.relsizes.range((Included(&Lsn(0)), Included(&lsn)));
+        let slice = inner.relsizes.range((Included(&Lsn(0)), Included(&lsn)));
 
         let result;
-        if let Some((_entry_lsn, entry)) = iter.next_back() {
+        if let Some((_entry_lsn, entry)) = slice.last() {
             result = *entry;
         // Use the base image if needed
         } else if let Some(predecessor) = &self.predecessor {
@@ -308,7 +309,7 @@ impl Layer for DeltaLayer {
     fn unload(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.page_version_metas = BTreeMap::new();
-        inner.relsizes = BTreeMap::new();
+        inner.relsizes = OrderedVec::default();
         inner.loaded = false;
         Ok(())
     }
@@ -412,7 +413,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: true,
                 page_version_metas: BTreeMap::new(),
-                relsizes,
+                relsizes: OrderedVec::from(relsizes),
             }),
             predecessor,
         };
@@ -468,7 +469,7 @@ impl DeltaLayer {
 
         // and relsizes to separate chapter
         let mut chapter = book.new_chapter(REL_SIZES_CHAPTER);
-        let buf = BTreeMap::ser(&inner.relsizes)?;
+        let buf = OrderedVec::ser(&inner.relsizes)?;
         chapter.write_all(&buf)?;
         let book = chapter.close()?;
 
@@ -557,7 +558,7 @@ impl DeltaLayer {
         let page_version_metas = BTreeMap::des(&chapter)?;
 
         let chapter = book.read_chapter(REL_SIZES_CHAPTER)?;
-        let relsizes = BTreeMap::des(&chapter)?;
+        let relsizes = OrderedVec::des(&chapter)?;
 
         debug!("loaded from {}", &path.display());
 
@@ -589,7 +590,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: false,
                 page_version_metas: BTreeMap::new(),
-                relsizes: BTreeMap::new(),
+                relsizes: OrderedVec::default(),
             }),
             predecessor,
         }
@@ -613,7 +614,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: false,
                 page_version_metas: BTreeMap::new(),
-                relsizes: BTreeMap::new(),
+                relsizes: OrderedVec::default(),
             }),
             predecessor: None,
         })
