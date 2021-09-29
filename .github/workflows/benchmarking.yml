@@ -132,7 +132,7 @@ jobs:
         pipenv run pytest test_runner/performance/ -m "remote" --skip-interfering-proc-check --out-dir zenith-perf-data/data
         cd zenith-perf-data
         git add data
-        git commit -m "add performance test result for $GITHUB_SHA zenith revision"
+        git commit --author="Bot <bot@example.com>" -m "add performance test result for $GITHUB_SHA zenith revision"
         git push https://$LIZARD_WIZZARD_BENCHMARK_TOKEN@github.com/zenithdb/zenith-perf-data.git testing
 
     - name: Stop cluster
