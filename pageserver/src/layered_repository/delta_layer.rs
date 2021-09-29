@@ -50,7 +50,6 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use log::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 // avoid binding to Write (conflicts with std::io::Write)
 // while being able to use std::fmt::Write's methods
 use std::fmt::Write as _;
@@ -401,7 +400,7 @@ impl DeltaLayer {
         dropped: bool,
         predecessor: Option<Arc<dyn Layer>>,
         page_versions: impl Iterator<Item = (&'a (u32, Lsn), &'a PageVersion)>,
-        relsizes: BTreeMap<Lsn, u32>,
+        relsizes: OrderedVec<Lsn, u32>,
     ) -> Result<DeltaLayer> {
         let delta_layer = DeltaLayer {
             path_or_conf: PathOrConf::Conf(conf),
@@ -414,7 +413,7 @@ impl DeltaLayer {
             inner: Mutex::new(DeltaLayerInner {
                 loaded: true,
                 page_version_metas: OrderedVec::default(), // TODO create with a size estimate
-                relsizes: OrderedVec::from(relsizes),
+                relsizes,
             }),
             predecessor,
         };
