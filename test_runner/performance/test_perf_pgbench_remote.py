@@ -24,7 +24,9 @@ class PgBenchRunner:
     pgbench_bin_path: str = "pgbench"
 
     def invoke(self, args: List[str]):
-        return subprocess.run([self.pgbench_bin_path, *args], check=True, capture_output=True)
+        return subprocess.run(
+            [self.pgbench_bin_path, *args], check=True, capture_output=True
+        )
 
     def init(self, vacuum: bool = True):
         args = []
@@ -49,23 +51,38 @@ class PgBenchRunner:
 def connstr():
     res = os.getenv("BENCHMARK_CONNSTR")
     if res is None:
-        raise ValueError("no connstr provided, use BENCHMARK_CONNSTR environment variable")
+        raise ValueError(
+            "no connstr provided, use BENCHMARK_CONNSTR environment variable"
+        )
     return res
 
 
-# TODO wait for connstr availability
+def get_transactions_matrix():
+    transactions = os.getenv("TEST_PB_BENCH_TRANSACTIONS_MATRIX")
+    if transactions is None:
+        return [10 ** 4, 10 ** 5]
+    return list(map(int, transactions.split(",")))
 
 
-@pytest.mark.parametrize("scale,transactions", [(1, 1000), (2, 2000)])
+def get_scales_matrix():
+    scales = os.getenv("TEST_PB_BENCH_SCALES_MATRIX")
+    if scales is None:
+        return [10, 20]
+    return list(map(int, scales.split(",")))
+
+
+@pytest.mark.parametrize(
+    "scale,transactions", list(zip(get_scales_matrix(), get_transactions_matrix()))
+)
 @pytest.mark.remote
 def test_pg_bench_remote(
     zenbenchmark: ZenithBenchmarker, connstr: str, scale: int, transactions: int
 ):
     pg_bin = os.getenv("PG_BIN")
     if pg_bin is not None:
-        pgbench_bin_path = os.path.join(pg_bin, 'pgbench')
+        pgbench_bin_path = os.path.join(pg_bin, "pgbench")
     else:
-        pgbench_bin_path = 'pgbench'
+        pgbench_bin_path = "pgbench"
 
     runner = PgBenchRunner(
         connstr=connstr,

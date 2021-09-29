@@ -125,6 +125,8 @@ jobs:
       env:
         PG_BIN: "/usr/pgsql-13/bin/"
         LIZARD_WIZZARD_BENCHMARK_TOKEN: "${{ secrets.LIZARD_WIZZARD_BENCHMARK_TOKEN }}"
+        TEST_PB_BENCH_TRANSACTIONS_MATRIX: "1000,2000"
+        TEST_PB_BENCH_SCALES_MATRIX: "5,10"
       run: |
         mkdir -p zenith-perf-data/data
         pipenv run pytest test_runner/performance/ -m "remote" --skip-interfering-proc-check --out-dir zenith-perf-data/data
