@@ -272,6 +272,7 @@ mod tests {
             conf,
             Arc::new(walredo_mgr),
             tenantid,
+            None,
         ));
 
         Ok(repo)

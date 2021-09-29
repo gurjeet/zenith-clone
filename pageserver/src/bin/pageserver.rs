@@ -498,19 +498,11 @@ fn start_pageserver(conf: &'static PageServerConf) -> Result<()> {
 
     join_handles.push(page_service_thread);
 
-    let storage_sync_thread =
-        pageserver::layered_repository::relish_storage::synced_storage::create_storage_sync_thread(
-            conf,
-        )?;
-
     for handle in join_handles.into_iter() {
         handle
             .join()
             .expect("thread panicked")
             .expect("thread exited with an error")
-    }
-    if let Some(storage_sync_thread) = storage_sync_thread {
-        storage_sync_thread.join().expect("thread panicked");
     }
     Ok(())
 }

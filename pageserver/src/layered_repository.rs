@@ -19,9 +19,7 @@ use log::*;
 use postgres_ffi::pg_constants::BLCKSZ;
 use serde::{Deserialize, Serialize};
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::ops::Bound::Included;
@@ -39,7 +37,7 @@ use crate::walredo::WalRedoManager;
 use crate::PageServerConf;
 use crate::{ZTenantId, ZTimelineId};
 
-use relish_storage::synced_storage::{LocalTimeline, RelishStorageWithBackgroundSync};
+use relish_storage::synced_storage::LocalTimeline;
 use zenith_metrics::{
     register_histogram, register_int_gauge_vec, Histogram, IntGauge, IntGaugeVec,
 };
@@ -116,6 +114,7 @@ pub struct LayeredRepository {
     timelines: Mutex<HashMap<ZTimelineId, Arc<LayeredTimeline>>>,
 
     walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
+    timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
 }
 
 /// Public interface
@@ -232,8 +231,6 @@ impl LayeredRepository {
                     None
                 };
 
-                let relish_storage =
-                    &relish_storage::synced_storage::RELISH_STORAGE_WITH_BACKGROUND_SYNC;
                 let mut timeline = LayeredTimeline::new(
                     self.conf,
                     metadata,
@@ -242,13 +239,17 @@ impl LayeredRepository {
                     self.tenantid,
                     Arc::clone(&self.walredo_mgr),
                     0, // init with 0 and update after layers are loaded,
-                    Some(Arc::clone(relish_storage)),
+                    self.timeline_upload_callback.as_ref().map(Arc::clone),
                 )?;
 
                 // List the layers on disk, and load them into the layer map
                 let latest_timeline_on_disk = timeline.load_layer_map()?;
-                if let Some(timeline) = latest_timeline_on_disk {
-                    relish_storage.schedule_timeline_upload(timeline);
+                if let Some((upload, timeline)) = self
+                    .timeline_upload_callback
+                    .as_ref()
+                    .zip(latest_timeline_on_disk)
+                {
+                    upload(timeline);
                 }
 
                 // needs to be after load_layer_map
@@ -278,12 +279,14 @@ impl LayeredRepository {
         conf: &'static PageServerConf,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
         tenantid: ZTenantId,
+        timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
     ) -> LayeredRepository {
         LayeredRepository {
             tenantid,
             conf,
             timelines: Mutex::new(HashMap::new()),
             walredo_mgr,
+            timeline_upload_callback,
         }
     }
 
@@ -445,7 +448,7 @@ impl LayeredRepository {
             let timeline = self.get_timeline_locked(*timelineid, &mut *timelines)?;
 
             if let Some(ancestor_timeline) = &timeline.ancestor_timeline {
-                // If target_timeline is specified, we only need to know branchpoints of its childs
+                // If target_timeline is specified, we only need to know branchpoints of its children
                 if let Some(timelineid) = target_timelineid {
                     if ancestor_timeline.timelineid == timelineid {
                         all_branchpoints
@@ -602,7 +605,7 @@ pub struct LayeredTimeline {
     current_logical_size_gauge: IntGauge,
 
     // TODO kb docs
-    relish_storage: Option<Arc<RelishStorageWithBackgroundSync>>,
+    timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
 }
 
 /// Public interface functions
@@ -984,7 +987,7 @@ impl LayeredTimeline {
         tenantid: ZTenantId,
         walredo_mgr: Arc<dyn WalRedoManager + Send + Sync>,
         current_logical_size: usize,
-        relish_storage: Option<Arc<RelishStorageWithBackgroundSync>>,
+        timeline_upload_callback: Option<Arc<dyn Fn(LocalTimeline) + Send + Sync>>,
     ) -> Result<LayeredTimeline> {
         let current_logical_size_gauge = LOGICAL_TIMELINE_SIZE
             .get_metric_with_label_values(&[&tenantid.to_string(), &timelineid.to_string()])
@@ -1008,7 +1011,7 @@ impl LayeredTimeline {
             ancestor_lsn: metadata.ancestor_lsn,
             current_logical_size: AtomicUsize::new(current_logical_size),
             current_logical_size_gauge,
-            relish_storage,
+            timeline_upload_callback,
         };
         Ok(timeline)
     }
@@ -1458,8 +1461,8 @@ impl LayeredTimeline {
         };
         let metadata_path =
             LayeredRepository::save_metadata(self.conf, self.timelineid, self.tenantid, &metadata)?;
-        if let Some(relish_storage) = &self.relish_storage {
-            relish_storage.schedule_timeline_upload(LocalTimeline {
+        if let Some(upload) = &self.timeline_upload_callback {
+            upload(LocalTimeline {
                 tenant_id: self.tenantid,
                 timeline_id: self.timelineid,
                 disk_consistent_lsn,

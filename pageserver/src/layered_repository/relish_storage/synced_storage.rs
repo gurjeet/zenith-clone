@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, BinaryHeap, HashMap},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -25,10 +25,10 @@ use crate::{
     PageServerConf,
 };
 
-use super::{local_fs::LocalFs, RelishStorage};
+use super::RelishStorage;
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum SyncTask {
+pub enum SyncTask {
     UrgentDownload(RemoteTimeline),
     Upload(LocalTimeline),
     Download(RemoteTimeline),
@@ -54,102 +54,12 @@ pub struct RemoteTimeline {
     pub delta_layers: BTreeSet<DeltaFileName>,
 }
 
-// TODO kb shared channel instead?
-lazy_static::lazy_static! {
-    pub static ref RELISH_STORAGE_WITH_BACKGROUND_SYNC: Arc<RelishStorageWithBackgroundSync> = Arc::new(RelishStorageWithBackgroundSync::new());
-}
-
-pub struct RelishStorageWithBackgroundSync {
-    enabled: AtomicBool,
-    queue: Mutex<BinaryHeap<SyncTask>>,
-}
-
-impl RelishStorageWithBackgroundSync {
-    pub fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(true),
-            queue: Mutex::new(BinaryHeap::new()),
-        }
-    }
-
-    pub fn schedule_timeline_upload(&self, timeline_upload: LocalTimeline) {
-        if self.is_enabled() {
-            self.queue
-                .lock()
-                .unwrap()
-                .push(SyncTask::Upload(timeline_upload));
-        }
-    }
-
-    fn schedule_timeline_download(&self, timeline_download: RemoteTimeline, urgent: bool) {
-        if self.is_enabled() {
-            self.queue.lock().unwrap().push(if urgent {
-                SyncTask::UrgentDownload(timeline_download)
-            } else {
-                SyncTask::Download(timeline_download)
-            })
-        }
-    }
-
-    fn disable(&self) {
-        self.enabled
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.queue.lock().unwrap().clear();
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn next(&self) -> Option<SyncTask> {
-        if self.is_enabled() {
-            let mut queue_accessor = self.queue.lock().unwrap();
-            let new_task = queue_accessor.pop();
-            log::debug!("current storage queue length: {}", queue_accessor.len());
-            new_task
-        } else {
-            None
-        }
-    }
-}
-
-pub fn create_storage_sync_thread(
+pub fn run_storage_sync_thread<
+    P: std::fmt::Debug,
+    S: 'static + RelishStorage<RelishStoragePath = P>,
+>(
     config: &'static PageServerConf,
-) -> anyhow::Result<Option<thread::JoinHandle<()>>> {
-    // TODO kb revert
-    // match &config.relish_storage_config {
-    //     Some(RelishStorageConfig::LocalFs(root)) => {
-    //         let relish_storage = LocalFs::new(root.clone())?;
-    //         Ok(Some(run_thread(
-    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
-    //             relish_storage,
-    //             &config.workdir,
-    //         )?))
-    //     }
-    //     Some(RelishStorageConfig::AwsS3(s3_config)) => {
-    //         let relish_storage = RustS3::new(s3_config)?;
-    //         Ok(Some(run_thread(
-    //             Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
-    //             relish_storage,
-    //             &config.workdir,
-    //         )?))
-    //     }
-    //     None => {
-    //         RELISH_STORAGE_WITH_BACKGROUND_SYNC.disable();
-    //         Ok(None)
-    //     }
-    // }
-    let relish_storage = LocalFs::new(PathBuf::from("/Users/someonetoignore/Downloads/tmp_dir"))?;
-    Ok(Some(run_thread(
-        config,
-        Arc::clone(&RELISH_STORAGE_WITH_BACKGROUND_SYNC),
-        relish_storage,
-    )?))
-}
-
-fn run_thread<P: std::fmt::Debug, S: 'static + RelishStorage<RelishStoragePath = P>>(
-    config: &'static PageServerConf,
-    sync_tasks_queue: Arc<RelishStorageWithBackgroundSync>,
+    sync_tasks_queue: Arc<Mutex<BinaryHeap<SyncTask>>>,
     relish_storage: S,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -169,7 +79,11 @@ fn run_thread<P: std::fmt::Debug, S: 'static + RelishStorage<RelishStoragePath =
             log::warn!("@@@@@@@@@@@, {:?}", latest_tenant_timelines);
 
             loop {
-                match sync_tasks_queue.next() {
+                let mut queue_accessor = sync_tasks_queue.lock().unwrap();
+                log::debug!("Upload queue length: {}", queue_accessor.len());
+                let next_task = queue_accessor.pop();
+                drop(queue_accessor);
+                match next_task {
                     Some(task) => runtime.block_on(async {
                         match task {
                             SyncTask::Download(download_data) => {
@@ -310,7 +224,7 @@ fn categorize_relish_uploads<
 // TODO kb very much duplicates the corresponding upload counterpart
 async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
-    sync_tasks_queue: &'a RelishStorageWithBackgroundSync,
+    sync_tasks_queue: &'a Mutex<BinaryHeap<SyncTask>>,
     relish_storage: &'a S,
     remote_timeline: RemoteTimeline,
     urgent: bool,
@@ -410,14 +324,16 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
                     metadata_path.display(),
                     e
                 );
-                sync_tasks_queue.schedule_timeline_download(
-                    RemoteTimeline {
-                        image_layers: BTreeSet::new(),
-                        delta_layers: BTreeSet::new(),
-                        ..remote_timeline
-                    },
-                    urgent,
-                );
+                let download = RemoteTimeline {
+                    image_layers: BTreeSet::new(),
+                    delta_layers: BTreeSet::new(),
+                    ..remote_timeline
+                };
+                sync_tasks_queue.lock().unwrap().push(if urgent {
+                    SyncTask::UrgentDownload(download)
+                } else {
+                    SyncTask::Download(download)
+                });
             }
         }
     } else {
@@ -426,14 +342,16 @@ async fn download_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath =
             failed_image_downloads.len(),
             failed_delta_downloads.len(),
         );
-        sync_tasks_queue.schedule_timeline_download(
-            RemoteTimeline {
-                image_layers: failed_image_downloads,
-                delta_layers: failed_delta_downloads,
-                ..remote_timeline
-            },
-            urgent,
-        );
+        let download = RemoteTimeline {
+            image_layers: failed_image_downloads,
+            delta_layers: failed_delta_downloads,
+            ..remote_timeline
+        };
+        sync_tasks_queue.lock().unwrap().push(if urgent {
+            SyncTask::UrgentDownload(download)
+        } else {
+            SyncTask::Download(download)
+        });
     }
 }
 
@@ -466,7 +384,7 @@ enum Layer {
 async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P>>(
     config: &'static PageServerConf,
     remote_timelines: &'a mut HashMap<(ZTenantId, ZTimelineId), RemoteTimeline>,
-    sync_tasks_queue: &'a RelishStorageWithBackgroundSync,
+    sync_tasks_queue: &'a Mutex<BinaryHeap<SyncTask>>,
     relish_storage: &'a S,
     mut new_upload: LocalTimeline,
 ) {
@@ -596,11 +514,14 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
                     new_upload.metadata_path.display(),
                     e
                 );
-                sync_tasks_queue.schedule_timeline_upload(LocalTimeline {
-                    image_layers: BTreeSet::new(),
-                    delta_layers: BTreeSet::new(),
-                    ..new_upload
-                });
+                sync_tasks_queue
+                    .lock()
+                    .unwrap()
+                    .push(SyncTask::Upload(LocalTimeline {
+                        image_layers: BTreeSet::new(),
+                        delta_layers: BTreeSet::new(),
+                        ..new_upload
+                    }));
             }
         }
     } else {
@@ -609,11 +530,14 @@ async fn upload_timeline<'a, P, S: 'static + RelishStorage<RelishStoragePath = P
             failed_image_uploads.len(),
             failed_delta_uploads.len(),
         );
-        sync_tasks_queue.schedule_timeline_upload(LocalTimeline {
-            image_layers: failed_image_uploads,
-            delta_layers: failed_delta_uploads,
-            ..new_upload
-        });
+        sync_tasks_queue
+            .lock()
+            .unwrap()
+            .push(SyncTask::Upload(LocalTimeline {
+                image_layers: failed_image_uploads,
+                delta_layers: failed_delta_uploads,
+                ..new_upload
+            }));
     }
 }
 

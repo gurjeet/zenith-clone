@@ -6,8 +6,8 @@
 //! The abstractions hide multiple custom external storage API implementations,
 //! such as AWS S3, local filesystem, etc., located in the submodules.
 
-mod local_fs;
-mod rust_s3;
+pub mod local_fs;
+pub mod rust_s3;
 /// A queue-based storage with the background machinery behind it to synchronize
 /// local page server layer files with external storage.
 pub mod synced_storage;
